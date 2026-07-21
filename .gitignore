@@ -1,0 +1,13 @@
+# Сборка и временные файлы CMake
+/build/
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+Makefile
+
+# Временные результаты работы
+*.txt
+!trace.txt
+
+# Системные файлы
+.clangd
