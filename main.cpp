@@ -10,7 +10,6 @@
 // Пользовательский интерфейс нашей библиотеки
 #include <cache_system.hpp>
 
-namespace po = boost::program_options;
 
 // Параметризация модели кэш-памяти
 constexpr cache::CacheConfig TEST_CONFIG {
@@ -105,6 +104,7 @@ void run_simulation(std::istream& in) {
 }
 
 int main(int argc, char* argv[]) {
+  namespace po = boost::program_options;
   // Настройка парсера аргументов (для старта программы)
   po::options_description desc("Allowed options");
   desc.add_options()

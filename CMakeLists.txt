@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Флаги компиляции
-add_compile_options(-Wall -Werror)
+add_compile_options(-Wall -Werror -pedantic)
 # Подключаем только главные 3 заголовочных файла
 add_library(cache_lib INTERFACE)
 target_include_directories(cache_lib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
