@@ -3,35 +3,41 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include <variant>
 
-#include "types.hpp"
+//#include "types.hpp"
 
 namespace cache {
 
-// Шина CPU -> Cache (Запрос от процессора)
-struct CpuRequest {
+// Запросы
+// =========================================================================
+struct ReadRequest {
   uint64_t address;
-  OperationType op_type;
-  std::vector<std::byte> data;
+  size_t size; // Количество запрашиваемых байт
 };
 
-// Шина Cache -> CPU (Ответ процессору)
-struct CpuResponse {
-  bool hit;
-  std::vector<std::byte> data;
-};
-
-// Шина Cache -> Memory (Запрос в  память на чтение/запись строки)
-struct MemRequest {
+struct WriteRequest {
   uint64_t address;
-  OperationType op_type; 
-  std::vector<std::byte> data; 
+  std::vector<std::byte> data; // Записываемые данные
 };
 
-// Шина Memory -> Cache (Ответ от памяти)
-struct MemResponse {
-  bool ready;
-  std::vector<std::byte> data;
+
+// Единый тип запроса
+using Request = std::variant<ReadRequest, WriteRequest>;
+// =========================================================================
+
+// Oтветы
+// =========================================================================
+struct ReadResponse {
+  std::vector<std::byte> data; // Возвращаемые байты
 };
 
-} // namespace cache
+struct WriteResponse {
+  bool success = true; // Сигнал подтверждения записи
+};
+
+// Единый тип ответа
+using Response = std::variant<ReadResponse, WriteResponse>;
+// =========================================================================
+
+}// namespace cache

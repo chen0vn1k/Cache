@@ -41,9 +41,6 @@ struct CacheConfig {
   size_t cache_size = 65536; // 64 KB
   size_t block_size = 64;
   size_t associativity = 1;
-  ReplacementPolicy replacement_policy = ReplacementPolicy::LRU;
-  WritePolicy write_policy = WritePolicy::WRITE_BACK;
-  
 };
 
 } // namespace cache

@@ -1,99 +1,82 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
 #include <algorithm>
-#include <optional>
 
-#include "../../types.hpp"
+//#include "../../types.hpp"
 
 namespace cache::detail {
 
-template <size_t block_size>
-class CacheLine {
-
+template <
+  typename ReplacementPolicy,
+  typename WritePolicy,
+  typename AllocationPolicy
+>
+class Block : // добавляем метаданные в зависимости от политик
+  public ReplacementPolicy::BlockMeta,
+  public AllocationPolicy::BlockMeta,
+  public WritePolicy::BlockMeta
+{
 private:
-  static constexpr size_t BLOCK_SIZE = block_size;
-  
-  using DataArray = std::array<std::byte, BLOCK_SIZE>;
-
-  uint64_t m_tag = 0;
-  bool m_valid = false;
-  bool m_dirty = false;
-  DataArray m_data{};
-  // Для LRU
-  uint64_t m_age = 0;
-
-  cache::BlockState m_state = cache::BlockState::INVALID;
+  uint64_t m_tag;
+  std::vector<std::byte> m_data;
 
 public:
-  CacheLine() = default;
-  
+  explicit Block(size_t block_size = 64) :
+    ReplacementPolicy::BlockMeta{},
+    WritePolicy::BlockMeta{},
+    AllocationPolicy::BlockMeta{},
+    m_tag(0),
+    m_data(block_size)
+  {} 
 
-  // Геттеры
-  uint64_t get_tag() const { return m_tag; }
-  bool get_valid() const { return m_valid; }
-  bool get_dirty() const { return m_dirty; }
-  DataArray& get_data() const { return m_data; }
-  uint64_t get_age() const { return m_age; }
-  cache::BlockState get_state() const { return m_state; }
+  // Поддержка копирования и перемещения (нужна для создания vector в кэше)
+    Block(const Block&) = default;
+    Block& operator=(const Block&) = default;
+    Block(Block&&) noexcept = default;
+    Block& operator=(Block&&) noexcept = default;
 
-  // Сеттеры
-  void set_tag(uint64_t tag) { m_tag = tag; }
-  void set_valid(bool valid) { m_valid = valid; }
-  void set_dirty(bool dirty) { m_dirty = dirty; }
-  void set_data(std::array<std::byte, BLOCK_SIZE> data) { m_data = data; }
-  void set_age(uint64_t age) { m_age = age; }
-  void set_state(cache::BlockState state) { m_state = state; }
+  // Работа с тэгами
+  uint64_t get_tag() const noexcept { return m_tag; }
+  void set_tag(uint64_t tag) noexcept { m_tag = tag; }
 
-  // Чтение данных (из среза кэш-линии)
-  std::optional<std::vector<std::byte>> read(uint64_t offset, size_t N) const {
-    // Проверка на валидность данных и не выход из блока
-    if (!m_valid || offset + N  > BLOCK_SIZE) {
-      return std::nullopt;
-    }
+  // Чтение данных (из среза блока)
+  std::vector<std::byte> read(uint64_t offset, size_t N) const {
     std::vector<std::byte> copy(N);
     std::copy(m_data.begin() + offset, m_data.begin() + offset + N, copy.begin());
     return copy;
   }
 
-  // Запись данных (в срез кэш-линии)
-  bool write(uint64_t tag, uint64_t offset, std::span<const std::byte> data) {
-    // Проверка границ кэш-линии
-    if (offset + data.size() > BLOCK_SIZE) {
-      return false;
-    }
+  // Запись данных (в срез блока)
+  void write(uint64_t tag, uint64_t offset, std::span<const std::byte> data) {
     // Итератор начала записи в кэш линии с учетом смещения
     auto m_data_start = m_data.begin() + offset;
     // Вставляем переписанные байты в нужное место кэш-линии
     std::copy(data.begin(), data.end(), m_data_start);
-
-    m_valid = true;
-    m_dirty = true;
-    m_state = cache::BlockState::DIRTY;
-    m_tag = tag;
-    return true;
   }
 
   // Загрузка из памяти
-  void download(uint64_t tag, const DataArray& data = {}) {
+  void download(uint64_t tag, const std::vector<std::byte>& data) {
     m_tag = tag;
-    m_valid = true;
-    m_dirty = false;
-    m_data = data;
-    m_state = cache::BlockState::VALID;
-    m_age = 0;
+    std::copy(data.begin(), data.end(), m_data.begin());
   }
 
   // Загрузка в память
-  DataArray upload() {
-    m_valid = false;
-    m_dirty = false;
-    m_state = cache::BlockState::INVALID;
+  std::vector<std::byte> upload() {
     return m_data;
+  }
+
+  // сброс блока
+  void reset() {
+    m_tag = 0;
+    std::fill(m_data.begin(), m_data.end(), std::byte{0});
+    // Сброс метаданных всех политик (даннах связянных с ними)
+    static_cast<typename ReplacementPolicy::BlockMeta&>(*this) = typename ReplacementPolicy::BlockMeta{};
+    static_cast<typename WritePolicy::BlockMeta&>(*this) = typename WritePolicy::BlockMeta{};
+    static_cast<typename AllocationPolicy::BlockMeta&>(*this) = typename AllocationPolicy::BlockMeta{};
   }
 };
 

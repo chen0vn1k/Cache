@@ -1,131 +1,97 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <optional>
 #include <span>
-#include <bit>
 
 #include "../../types.hpp"
-#include "cache_line.hpp"
+#include "block.hpp"
 
 namespace cache::detail {
 
-template <cache::CacheConfig cache_config>
+// Структурное представление разложенного адреса
+struct DecodedAddress {
+    uint64_t tag;
+    uint64_t set_index;
+    uint64_t offset;
+};
+
+template <
+  typename ReplacementPolicy,
+  typename WritePolicy,
+  typename AllocationPolicy
+>
 class CacheController;
 
-template<cache::CacheConfig cache_config>
+template<
+  typename ReplacementPolicy,
+  typename WritePolicy,
+  typename AllocationPolicy
+>
 class CacheCore{
   // Разрешаем контроллеру с той же конфигурацией полный доступ
-  friend class CacheController<cache_config>;
+  //friend class CacheController<cache_config>;
+public:
+  using Block_t = Block<ReplacementPolicy, WritePolicy, AllocationPolicy>;
+  using SetVector = std::vector<Block_t>;
+  using CacheVector = std::vector<SetVector>;
+
 private:
-  static constexpr size_t CACHE_SIZE = cache_config.cache_size;
-  static constexpr size_t BLOCK_SIZE = cache_config.block_size;
-  static constexpr size_t ASSOCIATIVITY = cache_config.associativity;
-  static constexpr cache::ReplacementPolicy POLICY = cache_config.replacement_policy;
-  static constexpr cache::WritePolicy WRITE_POLICY = cache_config.write_policy;
-
-  // Число наборов в кэше
-  static constexpr size_t NUM_SETS = CACHE_SIZE / (BLOCK_SIZE * ASSOCIATIVITY);
-  // размеры в битах для адреса
-  static constexpr size_t OFFSET_BITS = std::countr_zero(BLOCK_SIZE);
-  static constexpr size_t SET_INDEX_BITS = std::countr_zero(NUM_SETS);
-
-  static_assert(std::has_single_bit(BLOCK_SIZE));
-  static_assert(std::has_single_bit(NUM_SETS));
-
-  using CacheLine_t = CacheLine<BLOCK_SIZE>;
-  using SetArray = std::array<CacheLine_t, ASSOCIATIVITY>;
-  using CacheArray = std::array<SetArray, NUM_SETS>;
-  
   // Основные переменные кэша
-  CacheArray m_cache{};
+  size_t m_num_sets;
+  size_t m_associativity;
+  size_t m_block_size;
+  CacheVector m_cache{};
 
-  // Нужные функции
-  
-  // Получение смещения внутри блока
-  constexpr uint64_t get_offset(uint64_t address) const {
-    return address & (static_cast<uint64_t>(BLOCK_SIZE) - 1);
-  }
-  
-  // Получение тега
-  constexpr uint64_t get_tag(uint64_t address) const {
-    return address >> (OFFSET_BITS + SET_INDEX_BITS);
-  }
-  
-  // Получение индекса множества
-  constexpr uint64_t get_set_index(uint64_t address) const {
-    return (address >> OFFSET_BITS) & (static_cast<uint64_t>(NUM_SETS) - 1);
-  }
+  // Маски и сдвиги для быстрого декодирования адреса
+  size_t m_offset_bits = std::countr_zero(m_block_size);
+  size_t m_set_bits = std::countr_zero(m_num_sets);
 
-  // Восстановление адреса блока
-  constexpr uint64_t get_block_address(uint64_t tag, uint64_t set_index){
-    return (tag << (OFFSET_BITS + SET_INDEX_BITS)) | (set_index << OFFSET_BITS);
-  }
-  
-  // Поиск линии в наборе
-  std::optional<size_t> find_line(size_t set_index, uint64_t tag) const {
-    const auto& set = m_cache[set_index];
-   // Находим и возвращаем индекс или пустое значение 
-    for (size_t way = 0; way < ASSOCIATIVITY; ++way) {
-      if (set[way].get_valid() && set[way].get_tag() == tag) {
-        return way;
-      }
-    }
-    return std::nullopt;
-  }
+  // Вспомогательная функция проверки, является ли число сх
 
 public:
-  CacheCore() = default;
-  
-  // Чтение данных из кэша (считаем что запрос не выходит за гранциы одной кэш-линии)
-  std::optional<std::vector<std::byte>> read(uint64_t address, size_t N) {
-    // Вычисляем нужные парамеры по адресу
-    uint64_t offset = get_offset(address);
-    uint64_t set_index = get_set_index(address);
-    uint64_t tag = get_tag(address);
-    
-    std::optional way_index = find_line(set_index, tag); 
-    // проверяем есть ли кэш-линия в наборе
-    if (way_index) {
-      // Проверяем поподают ли данные в область одного блока  
-      const auto& cache_line = m_cache[set_index][*way_index];
+  CacheCore(size_t num_sets, size_t associativity, size_t block_size) :
+    m_num_sets(num_sets),
+    m_associativity(associativity),
+    m_block_size(block_size),
+    m_cache(num_sets, std::vector<Block_t>(associativity, Block_t(block_size)))
+  {}
 
-      return cache_line.read(offset, N);
-    } 
-    else {
-      return std::nullopt;
+  // Геттеры
+  size_t get_num_sets() const noexcept { return m_num_sets; }
+  size_t get_associativity() const noexcept { return m_associativity; }
+  size_t get_block_size() const noexcept { return m_block_size; }
+  size_t get_offset_bits() const noexcept {return m_offset_bits; }
+  size_t get_set_bits() const noexcept {return m_set_bits; }
+  // Доступ к набору
+  SetVector& get_set(size_t set_index) { return m_cache[set_index]; }
+  // Доступ к блоку
+  Block_t& get_block(size_t set_index, size_t way_index) { return m_cache[set_index][way_index]; }
+  // Восстановление адреса блока
+  uint64_t get_block_address(uint64_t tag, uint64_t set_index) {
+    return (tag << (m_offset_bits + m_set_bits)) | (set_index << m_offset_bits);
+  }
+
+  // Разбирает 64-битный адрес на tag, set_index и offset
+  DecodedAddress decode_address(uint64_t address) const noexcept {
+    DecodedAddress decoded;
+    decoded.offset = address & (static_cast<uint64_t>(m_block_size) - 1);
+    decoded.set_index = (address >> m_offset_bits) & (static_cast<uint64_t>(m_num_sets) - 1);
+    decoded.tag = address >> (m_offset_bits + m_set_bits);
+    return decoded;
+  }
+
+  // Поиск блока в наборе по тэгу (возвращаем указатель на блок)
+  const Block_t* find_block(size_t set_index, uint64_t tag) const {
+    auto& set = m_cache[set_index];
+    // Находим и возвращаем индекс или пустое значение 
+    for (auto& block : set) {
+      if (WritePolicy::is_valid(block) && block.get_tag() == tag) {
+        return &block;
+      }
     }
+    return nullptr;
   }
-  
-  // Запись данных в кэш
-  bool write(uint64_t address, size_t way_index, std::span<const std::byte> data) {
-    uint64_t offset = get_offset(address);
-    uint64_t set_index = get_set_index(address);
-    uint64_t tag = get_tag(address);
-    
-    CacheLine_t& cache_line = m_cache[set_index][way_index];
-    bool result = cache_line.write(tag, offset, data);
-    return result;
-
-    
-  }
-
-  // Загрузга из памяти
-  void download(uint64_t address, size_t way_index, const std::array<std::byte, BLOCK_SIZE>& data = {}) {
-    uint64_t set_index = get_set_index(address);
-    uint64_t tag = get_tag(address);
-
-    CacheLine_t& cache_line = m_cache[set_index][way_index];
-    cache_line.download(tag, data);
-  }
-  // Загрузка в память
-  std::array<std::byte, BLOCK_SIZE> upload(size_t set_index, size_t way_index) {
-    CacheLine_t& cache_line = m_cache[set_index][way_index];
-    return cache_line.upload();
-
-  }
-
 };
 
 } // namespace cache::detail
