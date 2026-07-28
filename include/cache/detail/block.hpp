@@ -51,10 +51,10 @@ public:
   }
 
   // Запись данных (в срез блока)
-  void write(uint64_t tag, uint64_t offset, std::span<const std::byte> data) {
+  void write(uint64_t offset, std::span<const std::byte> data) {
     // Итератор начала записи в кэш линии с учетом смещения
     auto m_data_start = m_data.begin() + offset;
-    // Вставляем переписанные байты в нужное место кэш-линии
+    // вставляем переписанные байты в нужное место кэш-линии
     std::copy(data.begin(), data.end(), m_data_start);
   }
 

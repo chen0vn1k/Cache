@@ -92,6 +92,14 @@ public:
     }
     return nullptr;
   }
+
+  // Поиск свободного блока в наборе
+  Block_t* find_invalid_block(size_t set_index) noexcept {
+      for (auto& block : m_cache[set_index]) {
+          if (!WritePolicy::is_valid(block)) return &block;
+      }
+      return nullptr;
+  }
 };
 
 } // namespace cache::detail
