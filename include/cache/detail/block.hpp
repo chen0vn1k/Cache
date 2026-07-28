@@ -27,8 +27,8 @@ private:
 public:
   explicit Block(size_t block_size = 64) :
     ReplacementPolicy::BlockMeta{},
-    WritePolicy::BlockMeta{},
     AllocationPolicy::BlockMeta{},
+    WritePolicy::BlockMeta{},
     m_tag(0),
     m_data(block_size)
   {} 
@@ -80,4 +80,4 @@ public:
   }
 };
 
-} // namespace caache::detail
+} // namespace cache::detail

@@ -1,11 +1,13 @@
 #pragma once
 
 #include <cstddef>
-#include <optional>
-#include <span>
+//#include <optional>
+//#include <span>
+#include <bit>
 
-#include "../../types.hpp"
+//#include "../../types.hpp"
 #include "block.hpp"
+
 
 namespace cache::detail {
 
@@ -85,6 +87,16 @@ public:
   const Block_t* find_block(size_t set_index, uint64_t tag) const {
     auto& set = m_cache[set_index];
     // Находим и возвращаем индекс или пустое значение 
+    for (auto& block : set) {
+      if (WritePolicy::is_valid(block) && block.get_tag() == tag) {
+        return &block;
+      }
+    }
+    return nullptr;
+  }
+
+  Block_t* find_block(size_t set_index, uint64_t tag) {
+    auto& set = m_cache[set_index];
     for (auto& block : set) {
       if (WritePolicy::is_valid(block) && block.get_tag() == tag) {
         return &block;

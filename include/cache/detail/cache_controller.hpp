@@ -33,7 +33,7 @@ private:
     // Обработка чтения
     else {
       const auto& r_req = std::get<ReadRequest>(req);
-      return block.read(offset, r_req.size);
+      return cache::ReadResponse{block.read(offset, r_req.size)};
     }
   }
   
@@ -42,9 +42,10 @@ private:
   cache::Response handle_hit(Block_t& block, const cache::Request& req, size_t offset, 
                              bool is_write, std::vector<Block_t>& set, LowerRequest& lower_req) {
     // обновляем метаданные allocation в наборе
-    ReplacementPolicy::touch(*block, set);
+    ReplacementPolicy::touch(block, set);
     
     if (is_write) {
+      WritePolicy::on_write_hit(block);
       auto response = execute(block, req, offset, true);
       // отправляем запрос дальше для write_through
       if constexpr (WritePolicy::requires_write_through()) lower_req(req);
@@ -77,6 +78,7 @@ private:
           // Выгружаем старый блок из памяти кэша
           lower_req(WriteRequest{old_addr, target_block->upload()});
         }
+        target_block->reset();
       }
       
       uint64_t block_addr = m_core.get_block_address(decoded.tag, decoded.set_index);
