@@ -81,10 +81,7 @@ int main(int argc, char* argv[]) {
   desc.add_options()
     ("help,h", "help")
     ("trace,t", po::value<std::string>(), "trace file")
-    ("fill,f", po::bool_switch()->default_value(false), "seed random blocks into MEM")
-    ("fill-blocks", po::value<size_t>()->default_value(16), "number of blocks")
-    ("fill-base", po::value<std::string>()->default_value("0x0"), "base address")
-    ("fill-seed", po::value<uint32_t>()->default_value(42), "RNG seed");
+    ("fill,f", po::bool_switch()->default_value(false), "seed random blocks into MEM");
 
   po::variables_map vm;
   try {
