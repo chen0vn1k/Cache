@@ -1,123 +1,142 @@
 #include <iostream>
 #include <fstream>
-#include <string>
 #include <sstream>
+#include <string>
 #include <vector>
-#include <iomanip>
+#include <random>
+#include <cstdint>
 
 #include <boost/program_options.hpp>
 
-#include "include/cache_system.hpp"
+#include "cache_system.hpp"
 
-void run_simulation(std::istream& in) {
-  // L1: 4 sets × 2-way, 64B
-  // L2: 8 sets × 4-way, 64B
-  cache::CacheSystem<> cache(4, 2, 64, 8, 4, 64);
+// Заполнение памяти (100 блоков)
+static void seed_memory(cache::SimpleMemory& mem, size_t nblocks, uint64_t base, uint32_t seed) {
+  (void)seed;
+  
+  const size_t bs = mem.block_size();
+  const size_t actual_blocks = std::min(nblocks, size_t(100));
+  
+  for (size_t i = 0; i < actual_blocks; ++i) {
+    std::vector<std::byte> data(bs);
+    // Заполнение блоков
+    for (size_t b = 0; b < bs; ++b) {
+      data[b] = static_cast<std::byte>(i & 0xFF);
+    }
+    mem.seed(base + i * bs, std::move(data));
+  }
+  
+  std::clog << "[INIT] seeded " << actual_blocks << " blocks into MEM from 0x"
+            << std::hex << base << std::dec << "\n";
+}
 
+static void run(std::istream& in, cache::Cache& l1) {
   std::string line;
   size_t tick = 1;
-
-  std::clog << "L1: 4 sets × 2-way, 64B | LRU + Write-Back\n";
-  std::clog << "L2: 8 sets × 4-way, 64B | FIFO + Write-Through\n";
 
   while (std::getline(in, line)) {
     if (line.empty() || line[0] == '#') continue;
 
     std::istringstream iss(line);
-    char op_char;
+    char op;
     uint64_t addr;
-
-    if (!(iss >> op_char >> std::hex >> addr)) continue;
+    if (!(iss >> op >> std::hex >> addr)) continue;
 
     std::clog << "\n--- Request " << tick++ << " ---\n";
 
-    cache::Request req;
-    bool is_write = false;
-
-    if (op_char == 'R' || op_char == 'r') {
-      size_t size = 0;
+    if (op == 'R' || op == 'r') {
+      size_t size = 4;
       iss >> std::dec >> size;
       if (size == 0) size = 4;
 
-      req = cache::ReadRequest{addr, size};
+      std::clog << "[CPU → L1] READ  0x" << std::hex << addr << std::dec
+                << " sz=" << size << "\n";
 
-      std::clog << "[CPU → L1] READ  addr: 0x" << std::hex << addr << std::dec
-                << " | size: " << size << " bytes\n";
+      auto resp = l1.process(cache::ReadRequest{addr, size});
+      auto& data = std::get<cache::ReadResponse>(resp).data;
+      std::clog << "[L1 → CPU] READ  " << data.size() << " bytes\n";
     }
-    else if (op_char == 'W' || op_char == 'w') {
-      is_write = true;
+    else if (op == 'W' || op == 'w') {
       std::vector<std::byte> data;
-      unsigned int byte_val;
-
-      while (iss >> std::hex >> byte_val) {
-        data.push_back(static_cast<std::byte>(byte_val & 0xFF));
-      }
+      unsigned v;
+      while (iss >> std::hex >> v)
+        data.push_back(static_cast<std::byte>(v & 0xFF));
       if (data.empty()) data.push_back(std::byte{0});
 
-      req = cache::WriteRequest{addr, std::move(data)};
+      std::clog << "[CPU → L1] WRITE 0x" << std::hex << addr << std::dec
+                << " sz=" << data.size() << "\n";
 
-      std::clog << "[CPU → L1] WRITE addr: 0x" << std::hex << addr << std::dec
-                << " | size: " << std::get<cache::WriteRequest>(req).data.size() << " bytes\n";
-    }
-    else {
-      std::cerr << "Unknown operation: " << op_char << "\n";
-      continue;
-    }
-
-    // Отправляем запрос в систему
-    auto resp = cache.process(req);
-
-    // Ответ
-    if (is_write) {
+      auto resp = l1.process(cache::WriteRequest{addr, std::move(data)});
       bool ok = std::get<cache::WriteResponse>(resp).success;
-      std::clog << "[L1 → CPU] WRITE " << (ok ? "OK" : "FAILED") << "\n";
-    } else {
-      auto& data = std::get<cache::ReadResponse>(resp).data;
-      std::clog << "[L1 → CPU] READ  returned " << data.size() << " bytes\n";
+      std::clog << "[L1 → CPU] WRITE " << (ok ? "OK" : "FAIL") << "\n";
     }
   }
-
-  std::clog << "\n=== SIMULATION FINISHED ===\n";
+  std::clog << "\n=== DONE ===\n";
 }
 
 int main(int argc, char* argv[]) {
   namespace po = boost::program_options;
 
-  po::options_description desc("Allowed options");
+  po::options_description desc("options");
   desc.add_options()
-    ("help,h", "показать справку")
-    ("trace,t", po::value<std::string>(),
-     "путь к файлу трассы (если не указан — читаем из stdin)");
+    ("help,h", "help")
+    ("trace,t", po::value<std::string>(), "trace file")
+    ("fill,f", po::bool_switch()->default_value(false), "seed random blocks into MEM")
+    ("fill-blocks", po::value<size_t>()->default_value(16), "number of blocks")
+    ("fill-base", po::value<std::string>()->default_value("0x0"), "base address")
+    ("fill-seed", po::value<uint32_t>()->default_value(42), "RNG seed");
 
   po::variables_map vm;
   try {
     po::store(po::parse_command_line(argc, argv, desc), vm);
     po::notify(vm);
   } catch (const std::exception& e) {
-    std::cerr << "CLI Error: " << e.what() << "\n";
+    std::cerr << e.what() << "\n";
     return 1;
   }
-
   if (vm.count("help")) {
     std::cout << desc << "\n";
     return 0;
   }
+  
+  // =============== ОБЪЯВЛЕНИЕ кэша =======================
 
-  if (vm.count("trace")) {
-    std::string file_path = vm["trace"].as<std::string>();
-    std::ifstream trace_file(file_path);
 
-    if (!trace_file.is_open()) {
-      std::cerr << "Error: Could not open trace file: " << file_path << "\n";
-      return 1;
-    }
+  auto l1 = cache::make_cache(4, 2, 64);
+  auto buffer = cache::make_cache<cache::LRUPolicy,
+                                  cache::WriteThroughPolicy,
+                                  cache::NoReadAllocatePolicy>(8, 4, 64);
+  auto l2 = cache::make_cache<cache::FIFOPolicy,
+                              cache::WriteThroughPolicy,
+                              cache::AllAllocatePolicy>(8, 4, 64);
+  auto mem = cache::SimpleMemory(64);
 
-    std::clog << "Using trace file: " << file_path << "\n";
-    run_simulation(trace_file);
-  } else {
-    std::clog << "No trace file provided. Reading from stdin (Ctrl+D to finish)...\n";
-    run_simulation(std::cin);
+  l1.set_name("L1");
+  buffer.set_name("BUFFER");
+  l2.set_name("L2");
+  mem.set_name("MEM");
+  // Заполнение слево направо как по иерархии кэшей сверху вниз
+  cache::link_hierarchy({&l1, &buffer, &l2}, &mem);
+
+  // ======================================================
+
+  // Заполнение
+  if (vm["fill"].as<bool>()) {
+    uint64_t base = 0;
+    std::istringstream(vm["fill-base"].as<std::string>()) >> std::hex >> base;
+    seed_memory(mem, vm["fill-blocks"].as<size_t>(), base, vm["fill-seed"].as<uint32_t>());
   }
 
+  if (vm.count("trace")) {
+    std::ifstream f(vm["trace"].as<std::string>());
+    if (!f) {
+      std::cerr << "cannot open trace\n";
+      return 1;
+    }
+    run(f, l1);
+  } else {
+    std::clog << "stdin (Ctrl+D to end)\n";
+    run(std::cin, l1);
+  }
   return 0;
 }

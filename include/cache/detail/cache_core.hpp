@@ -27,14 +27,13 @@ class CacheController;
 
 template<
   typename ReplacementPolicy,
-  typename WritePolicy,
-  typename AllocationPolicy
+  typename WritePolicy
 >
 class CacheCore{
   // Разрешаем контроллеру с той же конфигурацией полный доступ
   //friend class CacheController<cache_config>;
 public:
-  using Block_t = Block<ReplacementPolicy, WritePolicy, AllocationPolicy>;
+  using Block_t = Block<ReplacementPolicy, WritePolicy>;
   using SetVector = std::vector<Block_t>;
   using CacheVector = std::vector<SetVector>;
 
@@ -43,11 +42,11 @@ private:
   size_t m_num_sets;
   size_t m_associativity;
   size_t m_block_size;
-  CacheVector m_cache{};
-
   // Маски и сдвиги для быстрого декодирования адреса
-  size_t m_offset_bits = std::countr_zero(m_block_size);
-  size_t m_set_bits = std::countr_zero(m_num_sets);
+  size_t m_offset_bits;
+  size_t m_set_bits;
+
+  CacheVector m_cache{};
 
   // Вспомогательная функция проверки, является ли число сх
 
@@ -56,19 +55,28 @@ public:
     m_num_sets(num_sets),
     m_associativity(associativity),
     m_block_size(block_size),
+    m_offset_bits(std::countr_zero(block_size)),
+    m_set_bits(std::countr_zero(m_num_sets)),
     m_cache(num_sets, std::vector<Block_t>(associativity, Block_t(block_size)))
   {}
 
   // Геттеры
   size_t get_num_sets() const noexcept { return m_num_sets; }
+
   size_t get_associativity() const noexcept { return m_associativity; }
+
   size_t get_block_size() const noexcept { return m_block_size; }
+  
   size_t get_offset_bits() const noexcept {return m_offset_bits; }
+
   size_t get_set_bits() const noexcept {return m_set_bits; }
+
   // Доступ к набору
   SetVector& get_set(size_t set_index) { return m_cache[set_index]; }
+
   // Доступ к блоку
   Block_t& get_block(size_t set_index, size_t way_index) { return m_cache[set_index][way_index]; }
+
   // Восстановление адреса блока
   uint64_t get_block_address(uint64_t tag, uint64_t set_index) {
     return (tag << (m_offset_bits + m_set_bits)) | (set_index << m_offset_bits);

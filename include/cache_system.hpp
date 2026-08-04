@@ -1,10 +1,18 @@
 #pragma once
 
-#include <optional>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <iostream>
+#include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 #include <variant>
+#include <any>
+#include <typeindex>
+#include <stdexcept>
+#include <unordered_map>
 
 #include "interfaces.hpp"
 #include "cache/detail/policies.hpp"
@@ -12,132 +20,218 @@
 
 namespace cache {
 
-// Воспомогательные фукнции
-namespace detail {
-
-// простая модель памяти
-struct SimpleMemory {
-  size_t block_size;
-  explicit SimpleMemory(size_t bs) : block_size(bs) {}
-
-  void operator()(const Request& req) {
-    if (std::holds_alternative<ReadRequest>(req)) {
-      const auto& r = std::get<ReadRequest>(req);
-      std::clog << "    [Mem] READ  addr=0x" << std::hex << r.address
-                << std::dec << " size=" << r.size << "\n";
-    } else {
-      const auto& w = std::get<WriteRequest>(req);
-      std::clog << "    [Mem] WRITE addr=0x" << std::hex << w.address
-                << std::dec << " size=" << w.data.size() << "\n";
-    }
-  }
-
-  Response get_response() {
-    std::clog << "    [Mem] Returning zero-filled block (" << block_size << " bytes)\n";
-    return ReadResponse{std::vector<std::byte>(block_size, std::byte{0})};
-  }
-};
-
-// Коннектор между кэшами
-template <typename Controller>
-class CacheAsLowerLevel {
-public:
-  // Нижний кэш
-  Controller& ctrl;
-  // Обращения к памяти от нижнего кэша
-  std::function<void(const Request&)> to_lower;
-  std::function<Response()> from_lower;
-  // Запрос который будет храниться пока его не попросят
-  std::optional<Request> pending_req;
-
+// Общий интерфейс «нижнего уровня» (кэш или память)
+struct ILowerLevel {
+  virtual ~ILowerLevel() = default;
   
-  CacheAsLowerLevel(Controller& c,
-                    std::function<void(const Request&)> to_l,
-                    std::function<Response()> from_l)
-    : ctrl(c), to_lower(std::move(to_l)), from_lower(std::move(from_l))
-  {}
+  // Принять запрос сверху и вернуть ответ
+  virtual Response handle(const Request& req) = 0;
+};
 
-  void operator()(const Request& req) {
-    // Запоминаем запрос
-    pending_req = req;
-    // запись обрабатываем сразу
+// Модель простой памяти ()
+class SimpleMemory : public ILowerLevel {
+  size_t m_block_size;
+  // Хранение данных (адресс, блок данных)
+  std::unordered_map<uint64_t, std::vector<std::byte>> m_storage;
+  // Имя для объекта памяти
+  std::string m_name{"MEM"};
+
+public:
+  explicit SimpleMemory(size_t block_size = 64) : m_block_size(block_size) {}
+
+  // Определение имени (для логов)
+  void set_name(std::string name) { m_name = std::move(name); }
+
+  size_t block_size() const noexcept { return m_block_size; }
+
+  // Обработка запроса в память
+  Response handle(const Request& req) override {
+    // Запись
     if (std::holds_alternative<WriteRequest>(req)) {
-      auto dummy_res = [&]() -> Response { return from_lower(); };
-      ctrl.process_transaction(req, to_lower, dummy_res);
+      const auto& w = std::get<WriteRequest>(req);
+      
+      // Записываем блок в память 
+      m_storage[w.address] = w.data; 
+      
+      return WriteResponse{true};
+    }
+    // Чтение
+    else {
+      const auto& r = std::get<ReadRequest>(req);
+      auto it = m_storage.find(r.address);
+
+      // Если данные по адресу найдены
+      if (it != m_storage.end()) {
+        std::vector<std::byte> out = it->second;
+        
+        // Корректируем размер вывода, если он не совпадает с запросом
+        if (out.size() < r.size) { out.resize(r.size, std::byte{0}); }
+        else if (out.size() > r.size) { out.resize(r.size); }
+        
+        return ReadResponse{std::move(out), true};
+    }
+
+    // Если промах в памяти, возвращаем нули
+    return ReadResponse{std::vector<std::byte>(r.size, std::byte{0}), true};
     }
   }
 
-  // Ответ, когда его просит верхний кэш
-  Response get_response() {
-    if (!pending_req) return ReadResponse{};
-    auto req = *pending_req;
-    // обнуляем запрос после ответа
-    pending_req.reset();
-    return ctrl.process_transaction(req, to_lower, from_lower);
+  // Загрузка начальных данных (для тестов)
+  void seed(uint64_t address, std::vector<std::byte> data) {
+    m_storage[address] = std::move(data);
   }
 };
 
-} // namespace detail
-
-/**
- * Двухуровневая кэш-система.
- *
- * По умолчанию:
- *   L1 — LRU + Write-Back + Write-Allocate
- *   L2 — FIFO + Write-Through + Write-Allocate
- *
- */
-template <
-  typename L1Replacement = LRUPolicy,
-  typename L1Write = WriteBackPolicy,
-  typename L1Allocation = WriteAllocatePolicy,
-  typename L2Replacement = FIFOPolicy,
-  typename L2Write = WriteThroughPolicy,
-  typename L2Allocation = WriteAllocatePolicy
->
-class CacheSystem {
+// Один уровень кэша
+// Тип Cache (можно класть в контейнеры, передавать по ссылке)
+// Внутри шаблонный CacheController с выбранными политиками
+class Cache : public ILowerLevel {
 public:
-  using L1Controller = detail::CacheController<L1Replacement, L1Write, L1Allocation>;
-  using L2Controller = detail::CacheController<L2Replacement, L2Write, L2Allocation>;
+  // Создание с конкретными политиками
+  template <typename Repl, typename Write, typename Alloc>
+  static Cache make(size_t num_sets, size_t associativity, size_t block_size) {
+    Cache c;
+    c.m_impl = std::make_unique<TypedImpl<Repl, Write, Alloc>>(
+        num_sets, associativity, block_size);
+    return c;
+  }
+
+  Cache(Cache&&) noexcept = default;
+  Cache& operator=(Cache&&) noexcept = default;
+  Cache(const Cache&) = delete;
+  Cache& operator=(const Cache&) = delete;
+
+  // Связка иерархии
+
+  // Подключить нижний уровень (другой Cache или Memory).
+  void set_lower(ILowerLevel& lower) {
+    // указатель на нижний уровень
+    m_lower = &lower;
+  }
+
+  // Удалить нижний уровень
+  void clear_lower() {
+    m_lower = nullptr;
+  }
+
+  // Добавить имя кэшу
+  void set_name(std::string name) {
+    if (m_impl) { m_impl->set_name(std::move(name)); }
+  }
+
+  // Получить нижний уровень
+  ILowerLevel* lower() const noexcept { return m_lower; }
+
+
+  // Основной API
+
+  // Запрос с верхнего уровня (кэш или процессор)
+  Response process(const Request& req) {
+    return handle(req);
+  }
+
+  Response handle(const Request& req) override {
+    // если нет подключенного нижнего уровня
+    if (!m_impl)
+      throw std::runtime_error("Cache: not initialized");
+
+    // Определение фукнции запроса к нижнему уровню
+    std::function<void(const Request&)> to_lower = [this](const Request& r) {
+      m_pending = r;
+    };
+    // Определение функции ответа от нижнего уровня
+    std::function<Response()> from_lower = [this]() -> Response {
+      // Если есть запрос
+      if (!m_pending)
+        return ReadResponse{};
+      // удаляем запрос
+      Request r = *m_pending;
+      m_pending.reset();
+      if (!m_lower) {
+        throw std::runtime_error("LowerCache: not initialized"); 
+      }
+      return m_lower->handle(r);
+    };
+
+    return m_impl->process(req, to_lower, from_lower);
+  }
+
+
+
+  size_t block_size() const { return m_impl ? m_impl->block_size() : 0; }
+  size_t num_sets() const { return m_impl ? m_impl->num_sets() : 0; }
+  size_t associativity() const { return m_impl ? m_impl->associativity() : 0; }
 
 private:
-  L1Controller m_l1;
-  L2Controller m_l2;
-  // Память кэша
-  detail::SimpleMemory m_mem;
-  detail::CacheAsLowerLevel<L2Controller> m_l2_as_lower;
+  Cache() = default;
 
-  // Функции отправления запроса и ответа в нижний кэш
-  std::function<void(const Request&)> m_to_l2;
-  std::function<Response()> m_from_l2;
+  // Общий интерфейс запроса от верхнего уровня
+  struct IImpl {
+    virtual ~IImpl() = default;
+    virtual Response process(const Request& req,
+                             std::function<void(const Request&)>& to_lower,
+                             std::function<Response()>& from_lower) = 0;
+    virtual size_t block_size() const = 0;
+    virtual size_t num_sets() const = 0;
+    virtual size_t associativity() const = 0;
 
-public:
-  CacheSystem(size_t l1_sets, size_t l1_assoc, size_t l1_block,
-              size_t l2_sets, size_t l2_assoc, size_t l2_block)
-    : m_l1(l1_sets, l1_assoc, l1_block)
-    , m_l2(l2_sets, l2_assoc, l2_block)
-    , m_mem(l2_block)
-    , m_l2_as_lower(m_l2,
-        [this](const Request& req) { m_mem(req); },
-        [this]() { return m_mem.get_response(); })
-  {
-    // Функции связи кэшей
-    m_to_l2  = [this](const Request& req) { m_l2_as_lower(req); };
-    m_from_l2 = [this]() { return m_l2_as_lower.get_response(); };
+    virtual void set_name(std::string name) = 0;
+  };
 
-    std::clog << "CacheSystem created:\n"
-              << "  L1: " << l1_sets << " sets × " << l1_assoc << "-way, " << l1_block << "B\n"
-              << "  L2: " << l2_sets << " sets × " << l2_assoc << "-way, " << l2_block << "B\n";
-  }
+  // Просто оболочка над контроллером чтобы определять их одного типа
+  template <typename Repl, typename Write, typename Alloc>
+  class TypedImpl final : public IImpl {
+    detail::CacheController<Repl, Write, Alloc> m_controller;
+  public:
+    TypedImpl(size_t sets, size_t assoc, size_t blk)
+      : m_controller(sets, assoc, blk) {}
 
-  // Главный метод запрос от процессора (возвращает ответ) верхнему кэшу
-  Response process(const Request& req) {
-    return m_l1.process_transaction(req, m_to_l2, m_from_l2);
-  }
+    Response process(const Request& req,
+                     std::function<void(const Request&)>& to_lower,
+                     std::function<Response()>& from_lower) override {
+      return m_controller.process_transaction(req, to_lower, from_lower);
+    }
 
-  // Для проверки мб
-  size_t l1_block_size() const noexcept { return m_l1.get_block_size(); }
-  size_t l2_block_size() const noexcept { return m_l2.get_block_size(); }
+
+
+    void set_name(std::string name) override {
+      m_controller.set_name(std::move(name));
+    }
+
+    size_t block_size() const override { return m_controller.get_block_size(); }
+    size_t num_sets() const override { return m_controller.get_num_sets(); }
+    size_t associativity() const override { return m_controller.get_associativity(); }
+  };
+
+  // Сам кэш
+  std::unique_ptr<IImpl> m_impl;
+  /// Указатель на нижний по иерархии уровень
+  ILowerLevel* m_lower = nullptr;
+  // Буффер для запроса хранения запроса который отправляет вниз
+  std::optional<Request> m_pending;
 };
 
+// Фабрика с политиками по умолчанию: LRU + Write-Back + Write-Read-Allocate
+template <typename Repl = LRUPolicy,
+          typename Write = WriteBackPolicy,
+          typename Alloc = AllAllocatePolicy>
+Cache make_cache(size_t num_sets, size_t associativity, size_t block_size) {
+  return Cache::make<Repl, Write, Alloc>(num_sets, associativity, block_size);
+}
+
+// Связь несокльких кэшей и памяти
+// levels[0] → levels[1] → ... → levels.back() → memory
+// Все объекты должны оставаться живыми.
+inline void link_hierarchy(std::vector<Cache*> levels, ILowerLevel* memory = nullptr) {
+  if (levels.empty()) return;
+  for (size_t i = 0; i + 1 < levels.size(); ++i) {
+    if (!levels[i] || !levels[i + 1])
+      throw std::invalid_argument("link_hierarchy: null Cache pointer");
+    levels[i]->set_lower(*levels[i + 1]);
+  }
+  if (memory)
+    levels.back()->set_lower(*memory);
+}
+
 } // namespace cache
+

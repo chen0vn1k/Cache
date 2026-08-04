@@ -12,12 +12,10 @@ namespace cache::detail {
 
 template <
   typename ReplacementPolicy,
-  typename WritePolicy,
-  typename AllocationPolicy
+  typename WritePolicy
 >
 class Block : // добавляем метаданные в зависимости от политик
   public ReplacementPolicy::BlockMeta,
-  public AllocationPolicy::BlockMeta,
   public WritePolicy::BlockMeta
 {
 private:
@@ -27,7 +25,6 @@ private:
 public:
   explicit Block(size_t block_size = 64) :
     ReplacementPolicy::BlockMeta{},
-    AllocationPolicy::BlockMeta{},
     WritePolicy::BlockMeta{},
     m_tag(0),
     m_data(block_size)
@@ -76,7 +73,6 @@ public:
     // Сброс метаданных всех политик (даннах связянных с ними)
     static_cast<typename ReplacementPolicy::BlockMeta&>(*this) = typename ReplacementPolicy::BlockMeta{};
     static_cast<typename WritePolicy::BlockMeta&>(*this) = typename WritePolicy::BlockMeta{};
-    static_cast<typename AllocationPolicy::BlockMeta&>(*this) = typename AllocationPolicy::BlockMeta{};
   }
 };
 

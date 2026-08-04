@@ -30,6 +30,7 @@ using Request = std::variant<ReadRequest, WriteRequest>;
 // =========================================================================
 struct ReadResponse {
   std::vector<std::byte> data; // Возвращаемые байты
+  bool success = true;
 };
 
 struct WriteResponse {
