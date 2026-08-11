@@ -7,6 +7,7 @@
 
 #include "cache_core.hpp"
 #include "../../interfaces.hpp"
+#include "cache_trace.hpp"
 
 namespace cache::detail {
 
@@ -26,8 +27,9 @@ private:
   
   // Доступ контроллера к кэшу
   Core_t m_core;
-  // Собственное имя кэша
+  // Собственное имя кэша и нижнего по иерархии
   std::string m_name{"?"};
+  std::string m_lower_name{"?"};
 
   // Вспомогательные фукнции
   
@@ -35,15 +37,6 @@ private:
   template<typename LowerResponse>
   cache::Response wait_response(bool is_write, LowerResponse& lower_res) {
     auto lower_resp = lower_res();
-    // Ждем пока не получим ответ
-    /*
-    if (is_write) {
-      while (!std::get<WriteResponse>(lower_resp).success) {}
-    }
-    else {
-      while (!std::get<ReadResponse>(lower_resp).success) {}
-    }
-    */
     return lower_resp;
   }
 
@@ -70,6 +63,23 @@ private:
 
     uint64_t block_address = m_core.get_block_address(decoded.tag, decoded.set_index);
     
+    // =================== TRACE ===================
+    if constexpr (log::kEnabled) {
+      log::Tracer tr(m_name, m_lower_name);
+      const int way = log::way_of(block, set);
+      const size_t access_size = is_write
+          ? std::get<WriteRequest>(req).data.size()
+          : std::get<ReadRequest>(req).size;
+      const uint64_t req_addr = is_write
+          ? std::get<WriteRequest>(req).address
+          : std::get<ReadRequest>(req).address;
+      auto snap = block.upload();
+      auto slice = log::slice_data(snap, decoded.offset, access_size);
+      tr.hit(decoded.set_index, way, decoded.tag, decoded.offset,
+             is_write, req_addr, access_size, &slice);
+    }
+    // =============================================
+
     // обновляем метаданные в наборе
     ReplacementPolicy::touch(block, set);
     AllocationPolicy::hit_handle(*this, block_address);
@@ -77,23 +87,51 @@ private:
     
     // Обработка записи
     if (is_write) {
+
+      // =================== TRACE ===================
+      const char* from_state = nullptr;
+      if constexpr (log::kEnabled) {
+        from_state = log::StateName<WritePolicy>::get(block);
+      }
+      // =============================================
+
       WritePolicy::on_hit(block, true);
 
-      // ======== DEBUG ========
-      std::clog << "[" << m_name << "] "
-                << "Updated state for rewrited block\n";
-      // =======================
       auto response = execute(block, req, decoded.offset, true);
 
+      // =================== TRACE ===================
+      if constexpr (log::kEnabled) {
+        log::Tracer tr(m_name, m_lower_name);
+        tr.state(decoded.set_index, log::way_of(block, set), decoded.tag,
+                 from_state, log::StateName<WritePolicy>::get(block));
+      // =============================================
+
+      }
       // отправляем запрос дальше для write_through
       if constexpr (WritePolicy::requires_write_through()) { 
-        // ======== DEBUG ========
-        std::clog << "[" << m_name << "] "
-                  << "[WT] write-through to lower\n";
-        // =======================
+
+        // =================== TRACE ===================
+        if constexpr (log::kEnabled) {
+          log::Tracer tr(m_name, m_lower_name);
+          const auto& w = std::get<WriteRequest>(req);
+          tr.req_down(true, w.address, w.data.size(), &w.data);
+        }
+        // =============================================
+
         lower_req(req);
+
+        // =================== TRACE ===================
+        auto resp = wait_response(true, lower_res);
+        if constexpr (log::kEnabled) {
+          log::Tracer tr(m_name, m_lower_name);
+          const auto& w = std::get<WriteRequest>(req);
+          tr.resp_up(true, w.address, w.data.size(),
+                     std::get<WriteResponse>(resp).success);
+        }
+        (void)resp;
+        // =============================================
+
       }
-      wait_response(true, lower_res);
       return response;
     }
     // Обработка чтения
@@ -111,6 +149,16 @@ private:
 
     uint64_t block_address = m_core.get_block_address(decoded.tag, decoded.set_index);
 
+    // =================== TRACE ===================
+    if constexpr (log::kEnabled) {
+      log::Tracer tr(m_name, m_lower_name);
+      const uint64_t req_addr = is_write
+          ? std::get<WriteRequest>(req).address
+          : std::get<ReadRequest>(req).address;
+      tr.miss(decoded.set_index, decoded.tag, is_write, req_addr);
+    }
+    // =============================================
+
     // Проверям политику заведения
     bool need_allocate = is_write 
                          ? AllocationPolicy::need_write_allocate(*this, block_address)
@@ -118,64 +166,135 @@ private:
 
     // Если заведение запрещено
     if (!need_allocate) {
-      // ======== DEBUG ========
-      std::clog << "[" << m_name << "] "
-                << "[BYPASS] " << (is_write ? "WRITE" : "READ") << " no allocate, forward to lower\n";
-      // =======================
+
+      // =================== TRACE ===================
+      if constexpr (log::kEnabled) {
+        log::Tracer tr(m_name, m_lower_name);
+        const uint64_t req_addr = is_write
+            ? std::get<WriteRequest>(req).address
+            : std::get<ReadRequest>(req).address;
+        const size_t req_sz = is_write
+            ? std::get<WriteRequest>(req).data.size()
+            : std::get<ReadRequest>(req).size;
+        const auto* wr_data = is_write ? &std::get<WriteRequest>(req).data : nullptr;
+        tr.bypass(is_write, req_addr, req_sz, wr_data);
+        tr.req_down(is_write, req_addr, req_sz, wr_data);
+      }
+      // =============================================
+
       // Отправляем запрос ниже по иерархии в обход кэша
       lower_req(req);
-      return wait_response(is_write, lower_res);
+      auto resp = wait_response(is_write, lower_res);
+
+      // =================== TRACE ===================
+      if constexpr (log::kEnabled) {
+        log::Tracer tr(m_name, m_lower_name);
+        const uint64_t req_addr = is_write
+            ? std::get<WriteRequest>(req).address
+            : std::get<ReadRequest>(req).address;
+        const size_t req_sz = is_write
+            ? std::get<WriteRequest>(req).data.size()
+            : std::get<ReadRequest>(req).size;
+        if (!is_write) {
+          const auto& rd = std::get<ReadResponse>(resp);
+          tr.resp_up(false, req_addr, req_sz, rd.success, &rd.data);
+        } else {
+          tr.resp_up(true, req_addr, req_sz,
+                     std::get<WriteResponse>(resp).success);
+        }
+      }
+      // =============================================
+      
+      return resp;
     }
     else {
       // Ищем свободные блоки в наборе
       Block_t* target_block = m_core.find_invalid_block(decoded.set_index);
       // Если нет свободных, освобождаем один из занятых по политике replacement
       if (!target_block) {
-        // ======== DEBUG ========
-        std::clog << "[" << m_name << "] "
-                  << "[FULLSET] " << "no free block in set " << decoded.set_index << "\n";
-        // =======================
 
         target_block = &ReplacementPolicy::select_victim(set);
         
-        // ======== DEBUG ========
-        std::clog << "[" << m_name << "] "
-                  << "[VICTIM] " << "choose victim with tag 0x" << std::hex
-                  << target_block->get_tag() << std::dec << "\n";
-        // =======================
-        // Если старый блок изменен, то переносим перекидываем его ниже по иерархии
-        if (WritePolicy::is_dirty(*target_block)) {
-          // ======== DEBUG ========
-          std::clog << "[" << m_name << "] "
-                    << "[DIRTY] victim is dirty, write to the lower\n";
-          // =======================
+        uint64_t vtag = target_block->get_tag();
+        uint64_t vaddr = m_core.get_block_address(vtag, decoded.set_index);
+        bool dirty = WritePolicy::is_dirty(*target_block);
+        auto vdata = dirty ? target_block->upload() : std::vector<std::byte>{};
 
-          uint64_t old_addr = m_core.get_block_address(target_block->get_tag(), decoded.set_index);
-          lower_req(WriteRequest{old_addr, target_block->upload()});
+        
+        // =================== TRACE ===================
+        if constexpr (log::kEnabled) {
+          log::Tracer tr(m_name, m_lower_name);
+          if (!dirty) vdata = target_block->upload();
+          tr.evict(decoded.set_index, log::way_of(*target_block, set),
+                   vtag, vaddr, dirty, &vdata);
+        }
+        // =============================================
+
+        // Если старый блок изменен, то переносим перекидываем его ниже по иерархии
+        if (dirty) {
+
+          // =================== TRACE ===================
+          if constexpr (log::kEnabled) {
+            log::Tracer tr(m_name, m_lower_name);
+            tr.wb(vaddr, &vdata);
+            tr.req_down(true, vaddr, vdata.size(), &vdata);
+          }
+          // =============================================
+
+          lower_req(WriteRequest{vaddr, target_block->upload()});
           // Ожидаем ответа о завершении записи
-          wait_response(true, lower_res);
-          // ======== DEBUG ========
-          std::clog << "[" << m_name << "] "
-                    << "[RESPONSE] " << "Write is success\n";
-          // =======================
+          auto resp = wait_response(true, lower_res);
+
+          // =================== TRACE ===================
+          if constexpr (log::kEnabled) {
+            log::Tracer tr(m_name, m_lower_name);
+            tr.resp_up(true, vaddr, 0, std::get<WriteResponse>(resp).success);
+          }
+          (void)resp;
+          // =============================================
         }
         
       }
+
+      // =================== TRACE ===================
+      if constexpr (log::kEnabled) {
+        log::Tracer tr(m_name, m_lower_name);
+        tr.req_down(false, block_address, m_core.get_block_size());
+      }
+      // =============================================
       
       // Запрашиваем новый блок из памяти
       
       lower_req(ReadRequest{block_address, m_core.get_block_size()});
       auto lower_resp = wait_response(false, lower_res);
 
+      // =================== TRACE ===================
+      const char* from_state = nullptr;
+      if constexpr (log::kEnabled) {
+        log::Tracer tr(m_name, m_lower_name);
+        const auto& rd = std::get<ReadResponse>(lower_resp);
+        tr.resp_up(false, block_address, rd.data.size(), rd.success, &rd.data);
+        tr.alloc(decoded.set_index, log::way_of(*target_block, set), decoded.tag);
+        from_state = log::StateName<WritePolicy>::get(*target_block);
+      }
+      // =============================================
+
       // Загружаем новый блок в кэш
       target_block->download(decoded.tag, std::get<ReadResponse>(lower_resp).data);
-      // ======== DEBUG ========
-      std::clog << "[" << m_name << "] [FILL] set=" << decoded.set_index
-          << " tag=0x" << std::hex << decoded.tag << std::dec << "\n";
-      // =======================
       WritePolicy::on_miss(*target_block, is_write);
       ReplacementPolicy::touch(*target_block, set);
 
+
+    // =================== TRACE ===================
+    if constexpr (log::kEnabled) {
+      log::Tracer tr(m_name, m_lower_name);
+      const int alloc_way = log::way_of(*target_block, set);
+      tr.fill(decoded.set_index, alloc_way, decoded.tag,
+              &std::get<ReadResponse>(lower_resp).data);
+      tr.state(decoded.set_index, alloc_way, decoded.tag,
+               from_state, log::StateName<WritePolicy>::get(*target_block));
+    }
+    // =============================================
 
       return execute(*target_block, req, decoded.offset, is_write);
     }
@@ -195,13 +314,6 @@ private:
     // Декодируем адресс и ищем блок в кэше
     auto decoded = m_core.decode_address(address);
 
-    // ======== DEBUG ========
-    std::clog << "[" << m_name << "] "
-              << "[ACCESS] " << (is_write ? "WR" : "RD")
-              << " addr=0x" << std::hex << address << std::dec
-              << " set=" << decoded.set_index
-              << " tag=0x" << std::hex << decoded.tag << std::dec << "\n";
-    // =======================
 
 
     Block_t* block = m_core.find_block(decoded.set_index, decoded.tag);
@@ -209,23 +321,11 @@ private:
 
     // Ветка cache hit
     if (block) {
-      // ======== DEBUG ========
-      std::clog << "[" << m_name << "] "
-                << "[HIT] " << (is_write ? "WR" : "RD")
-                << " set=" << decoded.set_index
-                << " tag=0x" << std::hex << decoded.tag << std::dec << "\n";
-      // =======================
 
       return handle_hit(*block, req, decoded, is_write, set, lower_req, lower_res);
     }
     // Ветка cahce miss
     else {
-      // ======== DEBUG ========
-      std::clog << "[" << m_name << "] "
-                << "[MISS] " << (is_write ? "WR" : "RD")
-                << " set=" << decoded.set_index
-                << " tag=0x" << std::hex << decoded.tag << std::dec << "\n";
-
       return handle_miss(req, decoded, is_write, set, lower_req, lower_res);
     }
   }
@@ -315,10 +415,17 @@ public:
   size_t get_associativity() const noexcept { return m_core.get_associativity(); }
 
 
+  void flush() { m_core.flush(); }
+
   // Определение имени кэша
   void set_name(std::string name) { m_name = std::move(name); }
   // Получение имени кэша
   const std::string& name() const { return m_name; }
+
+  // Определение имени нижнего кэша
+  void set_lower_name(std::string name) { m_lower_name = std::move(name); }
+  // Получение имени нижнего кэша
+  const std::string& lower_name() const { return m_lower_name; }
 };
 
 } // namespace cache

@@ -3,34 +3,39 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <random>
 #include <cstdint>
+#include <stdexcept>
+#include <random>
+#include <algorithm>
 
 #include <boost/program_options.hpp>
 
 #include "cache_system.hpp"
+#include "include/cache/detail/cache_trace.hpp"
 
-// Заполнение памяти (100 блоков)
-static void seed_memory(cache::SimpleMemory& mem, size_t nblocks, uint64_t base, uint32_t seed) {
-  (void)seed;
-  
+// Определено в example/*.cpp
+cache::Hierarchy build_model();
+
+
+static void seed_memory(cache::SimpleMemory& mem) {
   const size_t bs = mem.block_size();
-  const size_t actual_blocks = std::min(nblocks, size_t(100));
-  
-  for (size_t i = 0; i < actual_blocks; ++i) {
+  const size_t nblocks = 16;
+
+  std::mt19937 rng(std::random_device{}());
+  std::uniform_int_distribution<unsigned> dist(0, 255);
+
+  for (size_t i = 0; i < nblocks; ++i) {
     std::vector<std::byte> data(bs);
-    // Заполнение блоков
-    for (size_t b = 0; b < bs; ++b) {
-      data[b] = static_cast<std::byte>(i & 0xFF);
-    }
-    mem.seed(base + i * bs, std::move(data));
+    std::generate(data.begin(), data.end(), 
+                  [&] { return static_cast<std::byte>(dist(rng)); });
+    mem.seed(i * bs, std::move(data));
   }
-  
-  std::clog << "[INIT] seeded " << actual_blocks << " blocks into MEM from 0x"
-            << std::hex << base << std::dec << "\n";
+
+  std::clog << "[INIT] seeded " << nblocks 
+            << " blocks with random data into MEM\n";
 }
 
-static void run(std::istream& in, cache::Cache& l1) {
+static void run_trace(std::istream& in, cache::Hierarchy& sys) {
   std::string line;
   size_t tick = 1;
 
@@ -40,7 +45,10 @@ static void run(std::istream& in, cache::Cache& l1) {
     std::istringstream iss(line);
     char op;
     uint64_t addr;
-    if (!(iss >> op >> std::hex >> addr)) continue;
+    if (!(iss >> op >> std::hex >> addr)) {
+      std::cerr << "[WARN] bad trace line " << tick << ": " << line << "\n";
+      continue;
+    }
 
     std::clog << "\n--- Request " << tick++ << " ---\n";
 
@@ -49,12 +57,8 @@ static void run(std::istream& in, cache::Cache& l1) {
       iss >> std::dec >> size;
       if (size == 0) size = 4;
 
-      std::clog << "[CPU → L1] READ  0x" << std::hex << addr << std::dec
-                << " sz=" << size << "\n";
-
-      auto resp = l1.process(cache::ReadRequest{addr, size});
-      auto& data = std::get<cache::ReadResponse>(resp).data;
-      std::clog << "[L1 → CPU] READ  " << data.size() << " bytes\n";
+      auto resp = sys.process(cache::ReadRequest{addr, size});
+      std::get<cache::ReadResponse>(resp);
     }
     else if (op == 'W' || op == 'w') {
       std::vector<std::byte> data;
@@ -63,12 +67,10 @@ static void run(std::istream& in, cache::Cache& l1) {
         data.push_back(static_cast<std::byte>(v & 0xFF));
       if (data.empty()) data.push_back(std::byte{0});
 
-      std::clog << "[CPU → L1] WRITE 0x" << std::hex << addr << std::dec
-                << " sz=" << data.size() << "\n";
-
-      auto resp = l1.process(cache::WriteRequest{addr, std::move(data)});
-      bool ok = std::get<cache::WriteResponse>(resp).success;
-      std::clog << "[L1 → CPU] WRITE " << (ok ? "OK" : "FAIL") << "\n";
+      sys.process(cache::WriteRequest{addr, std::move(data)});
+    }
+    else {
+      std::cerr << "[WARN] unknown operation '" << op << "' at line " << tick - 1 << "\n";
     }
   }
   std::clog << "\n=== DONE ===\n";
@@ -79,61 +81,51 @@ int main(int argc, char* argv[]) {
 
   po::options_description desc("options");
   desc.add_options()
-    ("help,h", "help")
-    ("trace,t", po::value<std::string>(), "trace file")
-    ("fill,f", po::bool_switch()->default_value(false), "seed random blocks into MEM");
+    ("help,h",    "help")
+    ("trace,t",   po::value<std::string>(),  "trace file")
+    ("fill,f",    po::bool_switch()->default_value(false), "seed random blocks into MEM");
 
   po::variables_map vm;
+
+  // Обработка аргументов
   try {
     po::store(po::parse_command_line(argc, argv, desc), vm);
     po::notify(vm);
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << "\n";
+  }
+  catch (const po::error& e) {
+    std::cerr << "error: " << e.what() << "\n\n" << desc << "\n";
     return 1;
   }
+
+  // Справка
   if (vm.count("help")) {
     std::cout << desc << "\n";
     return 0;
   }
-  
-  // =============== ОБЪЯВЛЕНИЕ кэша =======================
 
+  // Инициализация логирования
+  CACHE_LOG_INIT("*");
 
-  auto l1 = cache::make_cache(4, 2, 64);
-  auto buffer = cache::make_cache<cache::LRUPolicy,
-                                  cache::WriteThroughPolicy,
-                                  cache::NoReadAllocatePolicy>(8, 4, 64);
-  auto l2 = cache::make_cache<cache::FIFOPolicy,
-                              cache::WriteThroughPolicy,
-                              cache::AllAllocatePolicy>(8, 4, 64);
-  auto mem = cache::SimpleMemory(64);
+  auto sys = build_model();
 
-  l1.set_name("L1");
-  buffer.set_name("BUFFER");
-  l2.set_name("L2");
-  mem.set_name("MEM");
-  // Заполнение слево направо как по иерархии кэшей сверху вниз
-  cache::link_hierarchy({&l1, &buffer, &l2}, &mem);
-
-  // ======================================================
-
-  // Заполнение
+  // Заполнение памяти
   if (vm["fill"].as<bool>()) {
-    uint64_t base = 0;
-    std::istringstream(vm["fill-base"].as<std::string>()) >> std::hex >> base;
-    seed_memory(mem, vm["fill-blocks"].as<size_t>(), base, vm["fill-seed"].as<uint32_t>());
+    seed_memory(sys.mem());
   }
 
+  // Обработка трассы
   if (vm.count("trace")) {
-    std::ifstream f(vm["trace"].as<std::string>());
+    const std::string path = vm["trace"].as<std::string>();
+    std::ifstream f(path);
     if (!f) {
-      std::cerr << "cannot open trace\n";
+      std::cerr << "error: cannot open trace file: " << path << "\n";
       return 1;
     }
-    run(f, l1);
+    run_trace(f, sys);
   } else {
-    std::clog << "stdin (Ctrl+D to end)\n";
-    run(std::cin, l1);
+    std::clog << "reading from stdin (Ctrl+D to end)\n";
+    run_trace(std::cin, sys);
   }
+
   return 0;
 }

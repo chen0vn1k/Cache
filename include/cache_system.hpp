@@ -13,10 +13,13 @@
 #include <typeindex>
 #include <stdexcept>
 #include <unordered_map>
+#include <string>
+#include <string_view>
 
 #include "interfaces.hpp"
 #include "cache/detail/policies.hpp"
 #include "cache/detail/cache_controller.hpp"
+#include "cache/detail/cache_trace.hpp"
 
 namespace cache {
 
@@ -26,6 +29,7 @@ struct ILowerLevel {
   
   // Принять запрос сверху и вернуть ответ
   virtual Response handle(const Request& req) = 0;
+  virtual std::string_view name() const = 0;
 };
 
 // Модель простой памяти ()
@@ -41,6 +45,7 @@ public:
 
   // Определение имени (для логов)
   void set_name(std::string name) { m_name = std::move(name); }
+  std::string_view name() const override { return m_name; }
 
   size_t block_size() const noexcept { return m_block_size; }
 
@@ -50,8 +55,8 @@ public:
     if (std::holds_alternative<WriteRequest>(req)) {
       const auto& w = std::get<WriteRequest>(req);
       
-      // Записываем блок в память 
-      m_storage[w.address] = w.data; 
+      // Записываем блок в память
+      m_storage[w.address] = w.data;
       
       return WriteResponse{true};
     }
@@ -69,10 +74,10 @@ public:
         else if (out.size() > r.size) { out.resize(r.size); }
         
         return ReadResponse{std::move(out), true};
-    }
+      }
 
-    // Если промах в памяти, возвращаем нули
-    return ReadResponse{std::vector<std::byte>(r.size, std::byte{0}), true};
+      // Если промах в памяти, возвращаем нули
+      return ReadResponse{std::vector<std::byte>(r.size, std::byte{0}), true};
     }
   }
 
@@ -107,16 +112,24 @@ public:
   void set_lower(ILowerLevel& lower) {
     // указатель на нижний уровень
     m_lower = &lower;
+    if (m_impl)
+      m_impl->set_lower_name(std::string(lower.name()));
   }
 
   // Удалить нижний уровень
   void clear_lower() {
     m_lower = nullptr;
+    if (m_impl)
+      m_impl->set_lower_name("?");
   }
 
   // Добавить имя кэшу
   void set_name(std::string name) {
     if (m_impl) { m_impl->set_name(std::move(name)); }
+  }
+
+  std::string_view name() const override {
+    return m_impl ? m_impl->name() : "?";
   }
 
   // Получить нижний уровень
@@ -148,7 +161,7 @@ public:
       Request r = *m_pending;
       m_pending.reset();
       if (!m_lower) {
-        throw std::runtime_error("LowerCache: not initialized"); 
+        throw std::runtime_error("LowerCache: not initialized");
       }
       return m_lower->handle(r);
     };
@@ -176,6 +189,8 @@ private:
     virtual size_t associativity() const = 0;
 
     virtual void set_name(std::string name) = 0;
+    virtual void set_lower_name(std::string name) = 0;
+    virtual std::string_view name() const = 0;
   };
 
   // Просто оболочка над контроллером чтобы определять их одного типа
@@ -192,11 +207,13 @@ private:
       return m_controller.process_transaction(req, to_lower, from_lower);
     }
 
-
-
     void set_name(std::string name) override {
       m_controller.set_name(std::move(name));
     }
+    void set_lower_name(std::string name) override {
+      m_controller.set_lower_name(std::move(name));
+    }
+    std::string_view name() const override { return m_controller.name(); }
 
     size_t block_size() const override { return m_controller.get_block_size(); }
     size_t num_sets() const override { return m_controller.get_num_sets(); }
@@ -215,8 +232,86 @@ private:
 template <typename Repl = LRUPolicy,
           typename Write = WriteBackPolicy,
           typename Alloc = AllAllocatePolicy>
-Cache make_cache(size_t num_sets, size_t associativity, size_t block_size) {
-  return Cache::make<Repl, Write, Alloc>(num_sets, associativity, block_size);
+Cache make_cache(std::string name, size_t num_sets, size_t associativity, size_t block_size) {
+  auto c = Cache::make<Repl, Write, Alloc>(num_sets, associativity, block_size);
+  c.set_name(std::move(name));
+  return c;
+}
+
+inline SimpleMemory make_memory(std::string name, size_t block_size = 64) {
+  SimpleMemory m(block_size);
+  m.set_name(std::move(name));
+  return m;
+}
+
+// Иерархия кэшей
+class Hierarchy {
+  std::vector<Cache> m_levels;
+  std::optional<SimpleMemory> m_mem;
+  bool m_linked = false;
+
+  void ensure_linked() {
+    if (m_linked) return;
+    if (m_levels.empty())
+      throw std::runtime_error("Hierarchy: no cache levels");
+
+    for (size_t i = 0; i + 1 < m_levels.size(); ++i)
+      m_levels[i].set_lower(m_levels[i + 1]);
+
+    if (m_mem)
+      m_levels.back().set_lower(*m_mem);
+    m_linked = true;
+  }
+
+public:
+  Hierarchy() = default;
+  Hierarchy(Hierarchy&&) noexcept = default;
+  Hierarchy& operator=(Hierarchy&&) noexcept = default;
+  Hierarchy(const Hierarchy&) = delete;
+  Hierarchy& operator=(const Hierarchy&) = delete;
+
+  Hierarchy& add(Cache cache) {
+    m_levels.push_back(std::move(cache));
+    m_linked = false;
+    return *this;
+  }
+
+  Hierarchy& memory(SimpleMemory mem) {
+    m_mem = std::move(mem);
+    m_linked = false;
+    return *this;
+  }
+
+  Cache& top() {
+    ensure_linked();
+    return m_levels.front();
+  }
+
+  const Cache& top() const { return m_levels.front(); }
+
+  Response process(const Request& req) { return top().process(req); }
+
+  SimpleMemory& mem() {
+    if (!m_mem) throw std::runtime_error("Hierarchy: no memory attached");
+    return *m_mem;
+  }
+
+  size_t levels() const noexcept { return m_levels.size(); }
+};
+
+namespace detail {
+inline void hierarchy_append(Hierarchy& h, Cache& c)         { h.add(std::move(c)); }
+inline void hierarchy_append(Hierarchy& h, Cache&& c)        { h.add(std::move(c)); }
+inline void hierarchy_append(Hierarchy& h, SimpleMemory& m)  { h.memory(std::move(m)); }
+inline void hierarchy_append(Hierarchy& h, SimpleMemory&& m) { h.memory(std::move(m)); }
+}
+
+// Порядок аргументов = сверху вниз: L1, L2, …, MEM
+template <typename... Levels>
+Hierarchy make_hierarchy(Levels&&... levels) {
+  Hierarchy h;
+  (detail::hierarchy_append(h, std::forward<Levels>(levels)), ...);
+  return h;
 }
 
 // Связь несокльких кэшей и памяти
@@ -234,4 +329,3 @@ inline void link_hierarchy(std::vector<Cache*> levels, ILowerLevel* memory = nul
 }
 
 } // namespace cache
-
