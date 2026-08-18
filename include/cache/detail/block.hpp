@@ -10,10 +10,7 @@
 
 namespace cache::detail {
 
-template <
-  typename ReplacementPolicy,
-  typename WritePolicy
->
+template <typename ReplacementPolicy, typename WritePolicy>
 class Block : // добавляем метаданные в зависимости от политик
   public ReplacementPolicy::BlockMeta,
   public WritePolicy::BlockMeta
@@ -37,18 +34,27 @@ public:
     Block& operator=(Block&&) noexcept = default;
 
   // Работа с тэгами
-  uint64_t get_tag() const noexcept { return m_tag; }
-  void set_tag(uint64_t tag) noexcept { m_tag = tag; }
+  uint64_t get_tag() const noexcept
+  {
+    return m_tag;
+  }
+
+  void set_tag(uint64_t tag) noexcept
+  {
+    m_tag = tag;
+  }
 
   // Чтение данных (из среза блока)
-  std::vector<std::byte> read(uint64_t offset, size_t N) const {
+  std::vector<std::byte> read(uint64_t offset, size_t N) const
+  {
     std::vector<std::byte> copy(N);
     std::copy(m_data.begin() + offset, m_data.begin() + offset + N, copy.begin());
     return copy;
   }
 
   // Запись данных (в срез блока)
-  void write(uint64_t offset, std::span<const std::byte> data) {
+  void write(uint64_t offset, std::span<const std::byte> data)
+  {
     // Итератор начала записи в кэш линии с учетом смещения
     auto m_data_start = m_data.begin() + offset;
     // вставляем переписанные байты в нужное место кэш-линии
@@ -56,18 +62,21 @@ public:
   }
 
   // Загрузка из памяти
-  void download(uint64_t tag, const std::vector<std::byte>& data) {
+  void download(uint64_t tag, const std::vector<std::byte>& data)
+  {
     m_tag = tag;
     std::copy(data.begin(), data.end(), m_data.begin());
   }
 
   // Загрузка в память
-  std::vector<std::byte> upload() {
+  std::vector<std::byte> upload() const
+  {
     return m_data;
   }
 
   // сброс блока
-  void reset() {
+  void reset()
+  {
     m_tag = 0;
     std::fill(m_data.begin(), m_data.end(), std::byte{0});
     // Сброс метаданных всех политик (даннах связянных с ними)

@@ -2,12 +2,15 @@
 
 #include <vector>
 #include <string>
-#include <iostream>
-//#include <algorithm>
+#include <algorithm>
+#include <map>
+#include <ostream>
+#include <iomanip>
 
+#include "policies.hpp"
 #include "cache_core.hpp"
 #include "../../interfaces.hpp"
-#include "cache_trace.hpp"
+#include "trace_logger.hpp"
 
 namespace cache::detail {
 
@@ -20,7 +23,129 @@ class CacheController :
   // Метаданные для заведения
   private AllocationPolicy::AllocateMeta
 {
-private:
+public:
+  CacheController(size_t num_sets, size_t associativity, size_t block_size) :
+    AllocationPolicy::AllocateMeta{},
+    m_core(num_sets, associativity, block_size)
+  {}
+
+  // Обработка транзакции с интерфейсами
+  // lower_req - функция передачи данных в память
+  // lower_res функция получения данных из памяти
+  template<typename LowerRequest, typename LowerResponse>
+  cache::Response process_transaction(const cache::Request& req, 
+                                      LowerRequest& lower_req, 
+                                      LowerResponse& lower_res);
+
+  // Получить размер блока
+  size_t get_block_size() const noexcept
+  {
+    return m_core.get_block_size();
+  }
+
+  // Получить размер набора
+  size_t get_num_sets() const noexcept
+  {
+    return m_core.get_num_sets();
+  }
+
+  // Получить ассоциативность
+  size_t get_associativity() const noexcept
+  {
+    return m_core.get_associativity();
+  }
+
+  // Определение имени кэша
+  void set_name(std::string name)
+  {
+    m_name = std::move(name);
+  }
+
+  // Получение имени кэша
+  const std::string& name() const
+  {
+    return m_name;
+  }
+
+  // Определение имени нижнего кэша
+  void set_lower_name(std::string name)
+  {
+    m_lower_name = std::move(name);
+  }
+
+  // Получение имени нижнего кэша
+  const std::string& lower_name() const
+  {
+    return m_lower_name;
+  }
+
+  // Снимок валидных блоков: ключ = block address
+  // Формат строки: key=0xADDR set=.. way=.. tag=0x.. meta.. data=..
+  void dump(std::ostream& out) const
+  {
+    for (size_t s = 0; s < m_core.get_num_sets(); ++s)
+    {
+      const auto& set = m_core.get_set(s);
+      for (size_t w = 0; w < set.size(); ++w)
+      {
+        const auto& block = set[w];
+        if (!WritePolicy::is_valid(block))
+        {
+          continue;
+        }
+        const uint64_t key = m_core.get_block_address(block.get_tag(), s);
+        const auto meta = meta_of(block);
+        const auto data = block.upload();
+
+        out << std::hex << "0x" << key << std::dec
+            << " set=" << s
+            << " way=" << w
+            << " tag=0x" << std::hex << block.get_tag() << std::dec;
+        for (const auto& [k, v] : meta)
+        {
+          out << ' ' << k << '=' << v;
+        }
+        out << " data=";
+        // те же 4-байтные слова, без хвостовых нулевых слов
+        {
+          bool any = false;
+          size_t last_nz = data.size();
+          while (last_nz > 0 && data[last_nz - 1] == std::byte{0})
+          {
+            --last_nz;
+          }
+          size_t first_nz = 0;
+          while (first_nz < last_nz && data[first_nz] == std::byte{0})
+          {
+            ++first_nz;
+          }
+          // выравниваем first к границе слова 4
+          first_nz = (first_nz / 4) * 4;
+          if (last_nz == 0)
+          {
+            out << "0";
+          }
+          else
+          {
+            for (size_t i = first_nz; i < last_nz; i += 4)
+            {
+              if (any) out << '\'';
+              any = true;
+              uint32_t word = 0;
+              for (size_t j = 0; j < 4 && (i + j) < data.size(); ++j)
+              {
+                word |= (static_cast<uint32_t>(data[i + j]) << ((3 - j) * 8));
+              }
+              out << std::hex << std::setw(8) << std::setfill('0') << word << std::dec;
+            }
+          }
+        }
+        out << '\n';
+      }
+    }
+  }
+
+  private:
   using Core_t = CacheCore<ReplacementPolicy, WritePolicy>;
   using Block_t = typename Core_t::Block_t;
   // Метаданные для заведения
@@ -33,25 +158,61 @@ private:
 
   // Вспомогательные фукнции
   
+  // Индекс way в наборе
+  static int way_of(const Block_t& block, const std::vector<Block_t>& set)
+  {
+    return static_cast<int>(&block - set.data());
+  }
+
+ // Собрать метаданные политик для трассировки
+  static std::map<std::string, std::string> meta_of(const Block_t& block)
+  {
+    return cache::collect_metadata<ReplacementPolicy, WritePolicy>(block);
+  }
+
   // Получение ответа от нижнего кэша по иерархии с ожиданием
   template<typename LowerResponse>
-  cache::Response wait_response(bool is_write, LowerResponse& lower_res) {
+  cache::Response wait_response(bool is_write, LowerResponse& lower_res)
+  {
     auto lower_resp = lower_res();
     return lower_resp;
   }
 
   // Выполнение запроса (чтение и запись в одном блокe)
-  cache::Response execute(Block_t& block, const cache::Request& req, size_t offset, bool is_write) {
+  cache::Response execute(Block_t& block, const cache::Request& req, bool is_write,
+                          const DecodedAddress& decoded, std::vector<Block_t>& set)
+  {
+
+    auto& log = cache::log::TraceLogger::instance();
+
+    const int way = way_of(block, set);
+
+    auto pdata = block.upload();
+
     // Обработка записи
-    if (is_write) {
+    if (is_write)
+    {
       const auto& w_req = std::get<cache::WriteRequest>(req);
-      block.write(offset, w_req.data);
+      block.write(decoded.offset, w_req.data);
+      
+      // =================== TRACE ===================
+      log.write(m_name, w_req.address,
+              decoded.set_index, decoded.tag,
+              way, decoded.offset, meta_of(block), w_req.data);
+      // =============================================
       return WriteResponse{true};
     }
     // Обработка чтения
-    else {
+    else
+    {
       const auto& r_req = std::get<ReadRequest>(req);
-      return ReadResponse{block.read(offset, r_req.size), true};
+      auto r_data = block.read(decoded.offset, r_req.size);
+      // =================== TRACE ===================
+      log.read(m_name, r_req.address,
+              decoded.set_index, decoded.tag, way,
+              decoded.offset, meta_of(block), r_data);
+      // =============================================
+      return ReadResponse{r_data, true};
     }
   }
   
@@ -59,75 +220,57 @@ private:
   template<typename LowerRequest, typename LowerResponse>
   cache::Response handle_hit(Block_t& block, const cache::Request& req, const DecodedAddress& decoded, 
                              bool is_write, std::vector<Block_t>& set, LowerRequest& lower_req,
-                             LowerResponse lower_res) {
+                             LowerResponse lower_res)
+  {
 
     uint64_t block_address = m_core.get_block_address(decoded.tag, decoded.set_index);
     
     // =================== TRACE ===================
-    if constexpr (log::kEnabled) {
-      log::Tracer tr(m_name, m_lower_name);
-      const int way = log::way_of(block, set);
-      const size_t access_size = is_write
-          ? std::get<WriteRequest>(req).data.size()
-          : std::get<ReadRequest>(req).size;
-      const uint64_t req_addr = is_write
-          ? std::get<WriteRequest>(req).address
-          : std::get<ReadRequest>(req).address;
-      auto snap = block.upload();
-      auto slice = log::slice_data(snap, decoded.offset, access_size);
-      tr.hit(decoded.set_index, way, decoded.tag, decoded.offset,
-             is_write, req_addr, access_size, &slice);
-    }
+    auto& log = cache::log::TraceLogger::instance();
+
+    const uint64_t req_addr = is_write
+    ? std::get<WriteRequest>(req).address
+    : std::get<ReadRequest>(req).address;
+
+    const int way = way_of(block, set);
+
+    auto pdata = block.upload();
+
+    log.hit(m_name, is_write, req_addr,
+            decoded.set_index, decoded.tag,
+            way, meta_of(block), pdata);
+
     // =============================================
 
     // обновляем метаданные в наборе
-    ReplacementPolicy::touch(block, set);
     AllocationPolicy::hit_handle(*this, block_address);
 
     
     // Обработка записи
-    if (is_write) {
-
-      // =================== TRACE ===================
-      const char* from_state = nullptr;
-      if constexpr (log::kEnabled) {
-        from_state = log::StateName<WritePolicy>::get(block);
-      }
-      // =============================================
+    if (is_write)
+    {
 
       WritePolicy::on_hit(block, true);
+      ReplacementPolicy::touch(block, set);
 
-      auto response = execute(block, req, decoded.offset, true);
+      auto response = execute(block, req, true, decoded, set);
 
       // =================== TRACE ===================
-      if constexpr (log::kEnabled) {
-        log::Tracer tr(m_name, m_lower_name);
-        tr.state(decoded.set_index, log::way_of(block, set), decoded.tag,
-                 from_state, log::StateName<WritePolicy>::get(block));
+      log.update(m_name, true, req_addr, decoded.set_index, decoded.tag,
+                 way, meta_of(block), block.upload());
       // =============================================
 
-      }
       // отправляем запрос дальше для write_through
-      if constexpr (WritePolicy::requires_write_through()) { 
-
-        // =================== TRACE ===================
-        if constexpr (log::kEnabled) {
-          log::Tracer tr(m_name, m_lower_name);
-          const auto& w = std::get<WriteRequest>(req);
-          tr.req_down(true, w.address, w.data.size(), &w.data);
-        }
-        // =============================================
-
+      if constexpr (WritePolicy::requires_write_through())
+      { 
         lower_req(req);
 
         // =================== TRACE ===================
         auto resp = wait_response(true, lower_res);
-        if constexpr (log::kEnabled) {
-          log::Tracer tr(m_name, m_lower_name);
-          const auto& w = std::get<WriteRequest>(req);
-          tr.resp_up(true, w.address, w.data.size(),
-                     std::get<WriteResponse>(resp).success);
-        }
+        auto resp_data = is_write ? std::get<WriteRequest>(req).data
+                           : std::get<ReadResponse>(resp).data;
+        log.response(m_lower_name, m_name, true, req_addr,
+                     resp_data);
         (void)resp;
         // =============================================
 
@@ -135,9 +278,14 @@ private:
       return response;
     }
     // Обработка чтения
-    else {
+    else
+    {
       WritePolicy::on_hit(block, false);
-      return execute(block, req, decoded.offset, false);
+      ReplacementPolicy::touch(block, set);
+      auto ex = execute(block, req, false, decoded, set);
+      log.update(m_name, false, req_addr, decoded.set_index, decoded.tag,
+                 way, meta_of(block), block.upload());
+      return ex;
     }
   }
   
@@ -145,18 +293,18 @@ private:
   template<typename LowerRequest, typename LowerResponse>
   cache::Response handle_miss(const cache::Request& req, const DecodedAddress& decoded, 
                               bool is_write, std::vector<Block_t>& set, 
-                              LowerRequest& lower_req, LowerResponse& lower_res) {
+                              LowerRequest& lower_req, LowerResponse& lower_res)
+  {
+    auto& log = cache::log::TraceLogger::instance();
 
     uint64_t block_address = m_core.get_block_address(decoded.tag, decoded.set_index);
 
     // =================== TRACE ===================
-    if constexpr (log::kEnabled) {
-      log::Tracer tr(m_name, m_lower_name);
-      const uint64_t req_addr = is_write
-          ? std::get<WriteRequest>(req).address
-          : std::get<ReadRequest>(req).address;
-      tr.miss(decoded.set_index, decoded.tag, is_write, req_addr);
-    }
+    const uint64_t req_addr = is_write
+        ? std::get<WriteRequest>(req).address
+        : std::get<ReadRequest>(req).address;
+
+    log.miss(m_name, is_write, req_addr, decoded.set_index, decoded.tag);
     // =============================================
 
     // Проверям политику заведения
@@ -165,21 +313,10 @@ private:
                          : AllocationPolicy::need_read_allocate(*this, block_address);
 
     // Если заведение запрещено
-    if (!need_allocate) {
-
+    if (!need_allocate)
+    {
       // =================== TRACE ===================
-      if constexpr (log::kEnabled) {
-        log::Tracer tr(m_name, m_lower_name);
-        const uint64_t req_addr = is_write
-            ? std::get<WriteRequest>(req).address
-            : std::get<ReadRequest>(req).address;
-        const size_t req_sz = is_write
-            ? std::get<WriteRequest>(req).data.size()
-            : std::get<ReadRequest>(req).size;
-        const auto* wr_data = is_write ? &std::get<WriteRequest>(req).data : nullptr;
-        tr.bypass(is_write, req_addr, req_sz, wr_data);
-        tr.req_down(is_write, req_addr, req_sz, wr_data);
-      }
+      log.request(m_name, m_lower_name, req);
       // =============================================
 
       // Отправляем запрос ниже по иерархии в обход кэша
@@ -187,31 +324,21 @@ private:
       auto resp = wait_response(is_write, lower_res);
 
       // =================== TRACE ===================
-      if constexpr (log::kEnabled) {
-        log::Tracer tr(m_name, m_lower_name);
-        const uint64_t req_addr = is_write
-            ? std::get<WriteRequest>(req).address
-            : std::get<ReadRequest>(req).address;
-        const size_t req_sz = is_write
-            ? std::get<WriteRequest>(req).data.size()
-            : std::get<ReadRequest>(req).size;
-        if (!is_write) {
-          const auto& rd = std::get<ReadResponse>(resp);
-          tr.resp_up(false, req_addr, req_sz, rd.success, &rd.data);
-        } else {
-          tr.resp_up(true, req_addr, req_sz,
-                     std::get<WriteResponse>(resp).success);
-        }
-      }
+      auto resp_data = is_write ? std::get<WriteRequest>(req).data
+                           : std::get<ReadResponse>(resp).data;
+
+      log.response(m_lower_name, m_name, is_write, req_addr, resp_data);
       // =============================================
       
       return resp;
     }
-    else {
+    else
+    {
       // Ищем свободные блоки в наборе
       Block_t* target_block = m_core.find_invalid_block(decoded.set_index);
       // Если нет свободных, освобождаем один из занятых по политике replacement
-      if (!target_block) {
+      if (!target_block)
+      {
 
         target_block = &ReplacementPolicy::select_victim(set);
         
@@ -222,81 +349,73 @@ private:
 
         
         // =================== TRACE ===================
-        if constexpr (log::kEnabled) {
-          log::Tracer tr(m_name, m_lower_name);
-          if (!dirty) vdata = target_block->upload();
-          tr.evict(decoded.set_index, log::way_of(*target_block, set),
-                   vtag, vaddr, dirty, &vdata);
-        }
+        log.evict(m_name, is_write, vaddr,
+                  decoded.set_index, vtag, way_of(*target_block, set),
+                  meta_of(*target_block), vdata);
         // =============================================
 
         // Если старый блок изменен, то переносим перекидываем его ниже по иерархии
-        if (dirty) {
+        if (dirty)
+        {
+          cache::WriteRequest wb_req{vaddr, target_block->upload()};
+          cache::Request wb_as_req = wb_req;
 
           // =================== TRACE ===================
-          if constexpr (log::kEnabled) {
-            log::Tracer tr(m_name, m_lower_name);
-            tr.wb(vaddr, &vdata);
-            tr.req_down(true, vaddr, vdata.size(), &vdata);
-          }
+          log.request(m_name, m_lower_name, wb_as_req);
           // =============================================
 
-          lower_req(WriteRequest{vaddr, target_block->upload()});
+          lower_req(wb_req);
           // Ожидаем ответа о завершении записи
           auto resp = wait_response(true, lower_res);
 
           // =================== TRACE ===================
-          if constexpr (log::kEnabled) {
-            log::Tracer tr(m_name, m_lower_name);
-            tr.resp_up(true, vaddr, 0, std::get<WriteResponse>(resp).success);
-          }
-          (void)resp;
+          log.response(m_lower_name, m_name, true, vaddr, wb_req.data);
           // =============================================
+
+          (void) resp;
         }
-        
       }
 
       // =================== TRACE ===================
-      if constexpr (log::kEnabled) {
-        log::Tracer tr(m_name, m_lower_name);
-        tr.req_down(false, block_address, m_core.get_block_size());
-      }
+
       // =============================================
       
       // Запрашиваем новый блок из памяти
       
       lower_req(ReadRequest{block_address, m_core.get_block_size()});
+
+      // =================== TRACE ===================
+      cache::ReadRequest fill_req{block_address, m_core.get_block_size()};
+      cache::Request fill_as_req = fill_req;
+
+      log.request(m_name, m_lower_name, fill_as_req);
+      // =============================================
+
       auto lower_resp = wait_response(false, lower_res);
 
       // =================== TRACE ===================
-      const char* from_state = nullptr;
-      if constexpr (log::kEnabled) {
-        log::Tracer tr(m_name, m_lower_name);
-        const auto& rd = std::get<ReadResponse>(lower_resp);
-        tr.resp_up(false, block_address, rd.data.size(), rd.success, &rd.data);
-        tr.alloc(decoded.set_index, log::way_of(*target_block, set), decoded.tag);
-        from_state = log::StateName<WritePolicy>::get(*target_block);
-      }
+      const auto& rd = std::get<ReadResponse>(lower_resp);
+      log.response(m_lower_name, m_name, false, block_address, rd.data);
       // =============================================
 
       // Загружаем новый блок в кэш
       target_block->download(decoded.tag, std::get<ReadResponse>(lower_resp).data);
+      const int alloc_way = way_of(*target_block, set);
+
+
+      log.fill(m_name, is_write, block_address,
+               decoded.set_index, decoded.tag, alloc_way,
+               meta_of(*target_block),
+               rd.data);
+
       WritePolicy::on_miss(*target_block, is_write);
       ReplacementPolicy::touch(*target_block, set);
 
 
-    // =================== TRACE ===================
-    if constexpr (log::kEnabled) {
-      log::Tracer tr(m_name, m_lower_name);
-      const int alloc_way = log::way_of(*target_block, set);
-      tr.fill(decoded.set_index, alloc_way, decoded.tag,
-              &std::get<ReadResponse>(lower_resp).data);
-      tr.state(decoded.set_index, alloc_way, decoded.tag,
-               from_state, log::StateName<WritePolicy>::get(*target_block));
-    }
-    // =============================================
-
-      return execute(*target_block, req, decoded.offset, is_write);
+      auto ex = execute(*target_block, req, is_write, decoded, set);
+      log.update(m_name, is_write, req_addr, decoded.set_index, decoded.tag, alloc_way,
+                 meta_of(*target_block), target_block->upload());
+      return ex;
     }
   }
 
@@ -320,112 +439,93 @@ private:
     auto& set = m_core.get_set(decoded.set_index);
 
     // Ветка cache hit
-    if (block) {
-
+    if (block)
+    {
       return handle_hit(*block, req, decoded, is_write, set, lower_req, lower_res);
     }
     // Ветка cahce miss
-    else {
+    else
+    {
       return handle_miss(req, decoded, is_write, set, lower_req, lower_res);
     }
   }
 
-public:
-  CacheController(size_t num_sets, size_t associativity, size_t block_size) :
-    AllocationPolicy::AllocateMeta{},
-    m_core(num_sets, associativity, block_size)
-  {}
 
-  // Обработка транзакции с интерфейсами
-  // lower_req - функция передачи данных в память
-  // lower_res функция получения данных из памяти
-  template<typename LowerRequest, typename LowerResponse>
-  cache::Response process_transaction(const cache::Request& req, 
-                                      LowerRequest& lower_req, 
-                                      LowerResponse& lower_res) 
-  {
-    const size_t block_size = m_core.get_block_size();
-    // Узнаем какого типа запрос и получаем адресс
-    bool is_write = std::holds_alternative<cache::WriteRequest>(req);
-    
-    // Обработка чтения
-    if (!is_write) {
-      const auto& r_req = std::get<cache::ReadRequest>(req);
-      uint64_t current_address = r_req.address;
-      size_t bytes_left = r_req.size;
-
-      // Итоговый набор возвращаемых данных
-      std::vector<std::byte> result_data;
-      result_data.reserve(r_req.size);
-
-      // Цикл нарезки запроса по границам блоков
-      while (bytes_left > 0) {
-        size_t offset = current_address % block_size;
-        size_t chunk_size = std::min(bytes_left, block_size - offset);
-
-        // Создаем подзапрос для текущего блока
-        cache::ReadRequest sub_req{current_address, chunk_size};
-        auto sub_resp = process_single_transaction(sub_req, lower_req, lower_res);
-        
-        // Аккумулируем прочитанные байты в один большой ответ
-        const auto& read_resp = std::get<cache::ReadResponse>(sub_resp);
-        result_data.insert(result_data.end(), read_resp.data.begin(), read_resp.data.end());
-
-        // Двигаемся по адресу, до последнего байта слева
-        current_address += chunk_size;
-        bytes_left -= chunk_size;
-      }
-
-      return cache::ReadResponse{std::move(result_data), true};
-
-    } 
-    // Обработка записи
-    else {
-      const auto& w_req = std::get<cache::WriteRequest>(req);
-      uint64_t current_address = w_req.address;
-      size_t bytes_left = w_req.data.size();
-      size_t data_offset = 0;
-
-      // Цикл нарезки записи по границам блоков
-      while (bytes_left > 0) {
-        size_t offset = current_address % block_size;
-        size_t chunk_size = std::min(bytes_left, block_size - offset);
-
-        // Срез записываемых данных для текущего блока
-        std::vector<std::byte> sub_data(
-          w_req.data.begin() + data_offset, 
-          w_req.data.begin() + data_offset + chunk_size
-        );
-
-        cache::WriteRequest sub_req{current_address, std::move(sub_data)};
-        process_single_transaction(sub_req, lower_req, lower_res);
-
-        current_address += chunk_size;
-        data_offset += chunk_size;
-        bytes_left -= chunk_size;
-      }
-
-      return cache::WriteResponse{true};
-    }
-
-  }
-
-  size_t get_block_size() const noexcept { return m_core.get_block_size(); }
-  size_t get_num_sets() const noexcept { return m_core.get_num_sets(); }
-  size_t get_associativity() const noexcept { return m_core.get_associativity(); }
-
-
-  void flush() { m_core.flush(); }
-
-  // Определение имени кэша
-  void set_name(std::string name) { m_name = std::move(name); }
-  // Получение имени кэша
-  const std::string& name() const { return m_name; }
-
-  // Определение имени нижнего кэша
-  void set_lower_name(std::string name) { m_lower_name = std::move(name); }
-  // Получение имени нижнего кэша
-  const std::string& lower_name() const { return m_lower_name; }
 };
 
+
+// ================ Определение больших методов ==============
+template <typename RP, typename WP, typename AP>
+template<typename LowerRequest, typename LowerResponse>
+cache::Response CacheController<RP, WP, AP>::process_transaction(const cache::Request& req, 
+                                                                 LowerRequest & lower_req, 
+                                                                 LowerResponse& lower_res) 
+{
+  const size_t block_size = m_core.get_block_size();
+  // Узнаем какого типа запрос и получаем адресс
+  bool is_write = std::holds_alternative<cache::WriteRequest>(req);
+  
+  // Обработка чтения
+  if (!is_write)
+  {
+    const auto& r_req = std::get<cache::ReadRequest>(req);
+    uint64_t current_address = r_req.address;
+    size_t bytes_left = r_req.size;
+
+    // Итоговый набор возвращаемых данных
+    std::vector<std::byte> result_data;
+    result_data.reserve(r_req.size);
+
+    // Цикл нарезки запроса по границам блоков
+    while (bytes_left > 0)
+    {
+      size_t offset = current_address % block_size;
+      size_t chunk_size = std::min(bytes_left, block_size - offset);
+
+      // Создаем подзапрос для текущего блока
+      cache::ReadRequest sub_req{current_address, chunk_size};
+      auto sub_resp = process_single_transaction(sub_req, lower_req, lower_res);
+      
+      // Аккумулируем прочитанные байты в один большой ответ
+      const auto& read_resp = std::get<cache::ReadResponse>(sub_resp);
+      result_data.insert(result_data.end(), read_resp.data.begin(), read_resp.data.end());
+
+      // Двигаемся по адресу, до последнего байта слева
+      current_address += chunk_size;
+      bytes_left -= chunk_size;
+    }
+
+    return cache::ReadResponse{std::move(result_data), true};
+
+  } 
+  // Обработка записи
+  else
+  {
+    const auto& w_req = std::get<cache::WriteRequest>(req);
+    uint64_t current_address = w_req.address;
+    size_t bytes_left = w_req.data.size();
+    size_t data_offset = 0;
+
+    // Цикл нарезки записи по границам блоков
+    while (bytes_left > 0)
+    {
+      size_t offset = current_address % block_size;
+      size_t chunk_size = std::min(bytes_left, block_size - offset);
+
+      // Срез записываемых данных для текущего блока
+      std::vector<std::byte> sub_data(
+        w_req.data.begin() + data_offset, 
+        w_req.data.begin() + data_offset + chunk_size
+      );
+
+      cache::WriteRequest sub_req{current_address, std::move(sub_data)};
+      process_single_transaction(sub_req, lower_req, lower_res);
+
+      current_address += chunk_size;
+      data_offset += chunk_size;
+      bytes_left -= chunk_size;
+    }
+    return cache::WriteResponse{true};
+  }
+}
 } // namespace cache

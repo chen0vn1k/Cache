@@ -11,12 +11,14 @@ namespace cache {
 
 // Запросы
 // =========================================================================
-struct ReadRequest {
+struct ReadRequest
+{
   uint64_t address;
   size_t size; // Количество запрашиваемых байт
 };
 
-struct WriteRequest {
+struct WriteRequest
+{
   uint64_t address;
   std::vector<std::byte> data; // Записываемые данные
 };
@@ -28,12 +30,14 @@ using Request = std::variant<ReadRequest, WriteRequest>;
 
 // Oтветы
 // =========================================================================
-struct ReadResponse {
+struct ReadResponse
+{
   std::vector<std::byte> data; // Возвращаемые байты
   bool success = true;
 };
 
-struct WriteResponse {
+struct WriteResponse
+{
   bool success = true; // Сигнал подтверждения записи
 };
 

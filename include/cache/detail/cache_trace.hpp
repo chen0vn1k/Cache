@@ -25,7 +25,7 @@ namespace cache::log {
 inline constexpr bool kEnabled = (CACHE_ENABLE_LOG != 0);
 
 } // namespace cache::log
-
+#define CACHE_ENABLE_LOG 1
 #if CACHE_ENABLE_LOG
 
 #include <sstream>
@@ -170,7 +170,7 @@ inline void append_data(std::ostringstream& o, const std::vector<std::byte>* dat
       [](std::byte b) { return b == std::byte{0}; });
   
   if (all_zero) {
-    o << "0x" << std::hex << total << std::dec << " нули";
+    o << "0x" << std::hex << total << std::dec ;
     return;
   }
   
