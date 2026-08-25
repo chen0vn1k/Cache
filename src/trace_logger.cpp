@@ -1,3 +1,5 @@
+#include <iomanip>
+
 #include"../include/cache/detail/trace_logger.hpp"
 #include"../include/interfaces.hpp"
 
@@ -21,48 +23,31 @@ std::string string_data(const std::vector<std::byte>& data)
   {
     return {};
   }
-
-  std::vector<uint32_t> words;
-  words.reserve((data.size() + 3) / 4);
-  for (size_t i = 0; i < data.size(); i += 4)
-  {
-    uint32_t word = 0;
-    for (size_t j = 0; j < 4 && (i + j) < data.size(); ++j)
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    
+    size_t size = data.size();
+    for (size_t i = 0; i < size; i += 4)
     {
-      word |= (static_cast<uint32_t>(data[i + j]) << ((3 - j) * 8));
-    }
-    words.push_back(word);
-  }
+        if (i != 0) {
+            oss << '\'';
+        }
 
-  if (std::all_of(words.begin(), words.end(), [](uint32_t w) { return w == 0; }))
-  {
-    return "0";
-  }
+        // Запоминаем позицию в потоке перед началом записи текущего 4-байтового слова
+        std::string word;
+        for (size_t j = 0; j < 4 && (i + j) < size; ++j)
+        {
+            // Используем промежуточную строку
+            unsigned int val = std::to_integer<unsigned int>(data[size - 1 -i - j]);
+            
+            oss << std::setw(2) << val;
+        }
+    } 
 
-  size_t first = 0;
-  while (first < words.size() && words[first] == 0)
-  {
-    ++first;
-  }
-  size_t last = words.size();
-  while (last > first && words[last - 1] == 0)
-  {
-    --last;
-  }
-
-  std::string result;
-  for (size_t i = first; i < last; ++i)
-  {
-    if (i > first)
-    {
-      result += '\'';
-    }
-    result += std::format("{:08x}", words[i]);
-  }
-  return result;
+    return oss.str();
 }
 
-// Форматирование метаданных политик ...
+// Форматирование метаданных политик 
 std::string string_metadata( const std::map<std::string, std::string>& metadata)
 {
   if (metadata.empty())
@@ -111,7 +96,10 @@ void TraceLogger::emit(const TraceInfo& info)
   std::ostringstream msg;
 
   // addr=
-  msg << std::showbase << "addr=" << std::hex << info.address << std::dec << std::noshowbase;
+  if (info.address.has_value())
+  {
+    msg << std::showbase << "addr=" << std::hex << info.address.value() << std::dec << std::noshowbase;
+  }
 
   // size=  (только для RD в REQ)
   if (info.event == "REQ" && info.operation == "RD" && info.size != 0)
@@ -120,21 +108,21 @@ void TraceLogger::emit(const TraceInfo& info)
   }
 
   // set= tag= way= offset=
-  if (info.set)
+  if (info.set.has_value())
   {
-    msg << " set=" << info.set;
+    msg << " set=" << info.set.value();
   }
-  if (info.tag)
+  if (info.tag.has_value())
   {
-    msg << std::showbase << " tag=" << std::hex << info.tag << std::dec << std::noshowbase;
+    msg << std::showbase << " tag=" << std::hex << info.tag.value() << std::dec << std::noshowbase;
   }
-  if (info.way)
+  if (info.way.has_value())
   {
-    msg << " way=" << info.way;
+    msg << " way=" << info.way.value();
   }
-  if (info.offset)
+  if (info.offset.has_value())
   {
-    msg << " offset=" << info.offset;
+    msg << " offset=" << info.offset.value();
   }
 
 
@@ -149,6 +137,11 @@ void TraceLogger::emit(const TraceInfo& info)
   if (!info.data.empty())
   {
     msg << " data=" << string_data(info.data);
+  }
+
+  if (!info.other.empty())
+  {
+    msg << info.other;
   }
 
   BOOST_LOG(m_logger)
@@ -201,6 +194,34 @@ void TraceLogger::response(std::string_view from, std::string_view to, bool is_w
 
   emit(info);
 }
+
+// Логирование ответа
+void TraceLogger::response(std::string_view from, std::string_view to, Response resp,
+                           uint64_t address)
+{
+  const std::string cache_name = std::string(from) + "->" + std::string(to);
+
+  TraceInfo info;
+  info.name     = cache_name;
+  info.event     = "RESP";
+
+  if (std::holds_alternative<WriteResponse>(resp))
+  {
+    info.operation = "WR";
+    info.address   = address;
+    info.other     = "success";
+  }
+  else
+  {
+    const auto& r = std::get<ReadResponse>(resp);
+    info.operation = "RD";
+    info.address   = address;
+    info.data      = r.data;
+  }
+
+  emit(info);
+}
+
 
 // Логирование попадания в кэш
 void TraceLogger::hit(std::string_view cache, bool is_write, uint64_t address,

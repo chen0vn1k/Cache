@@ -164,7 +164,7 @@ public:
     return static_cast<int>(&block - set.data());
   }
 
- // Собрать метаданные политик для трассировки
+  // Собрать метаданные политик для трассировки
   static std::map<std::string, std::string> meta_of(const Block_t& block)
   {
     return cache::collect_metadata<ReplacementPolicy, WritePolicy>(block);
@@ -209,8 +209,8 @@ public:
       auto r_data = block.read(decoded.offset, r_req.size);
       // =================== TRACE ===================
       log.read(m_name, r_req.address,
-              decoded.set_index, decoded.tag, way,
-              decoded.offset, meta_of(block), r_data);
+               decoded.set_index, decoded.tag, way,
+               decoded.offset, meta_of(block), r_data);
       // =============================================
       return ReadResponse{r_data, true};
     }
@@ -301,8 +301,8 @@ public:
 
     // =================== TRACE ===================
     const uint64_t req_addr = is_write
-        ? std::get<WriteRequest>(req).address
-        : std::get<ReadRequest>(req).address;
+                              ? std::get<WriteRequest>(req).address
+                              : std::get<ReadRequest>(req).address;
 
     log.miss(m_name, is_write, req_addr, decoded.set_index, decoded.tag);
     // =============================================
@@ -415,6 +415,7 @@ public:
       auto ex = execute(*target_block, req, is_write, decoded, set);
       log.update(m_name, is_write, req_addr, decoded.set_index, decoded.tag, alloc_way,
                  meta_of(*target_block), target_block->upload());
+
       return ex;
     }
   }
@@ -449,8 +450,6 @@ public:
       return handle_miss(req, decoded, is_write, set, lower_req, lower_res);
     }
   }
-
-
 };
 
 

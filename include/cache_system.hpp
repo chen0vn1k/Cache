@@ -162,7 +162,6 @@ public:
 };
 
 // Один уровень кэша
-// Тип Cache (можно класть в контейнеры, передавать по ссылке)
 // Внутри шаблонный CacheController с выбранными политиками
 class Cache : public ILowerLevel
 {
@@ -228,10 +227,14 @@ public:
 
   // Основной API
 
-  // Запрос с верхнего уровня (кэш или процессор)
+  // Запрос с верхнего уровня 
   Response process(const Request& req)
   {
-    return handle(req);
+
+    Response resp = handle(req);
+    
+
+    return resp;
   }
 
   Response handle(const Request& req) override
@@ -414,33 +417,6 @@ inline SimpleMemory make_memory(std::string name, size_t block_size = 64)
 // Иерархия кэшей
 class Hierarchy
 {
-  std::vector<Cache> m_levels;
-  std::optional<SimpleMemory> m_mem;
-  bool m_linked = false;
-
-  void ensure_linked()
-  {
-    if (m_linked)
-    {
-      return;
-    }
-
-    if (m_levels.empty())
-    {
-      throw std::runtime_error("Hierarchy: no cache levels");
-    }
-
-    for (size_t i = 0; i + 1 < m_levels.size(); ++i)
-    {
-      m_levels[i].set_lower(m_levels[i + 1]);
-    }
-
-    if (m_mem)
-    {
-      m_levels.back().set_lower(*m_mem);
-    }
-    m_linked = true;
-  }
 public:
   Hierarchy() = default;
   Hierarchy(Hierarchy&&) noexcept = default;
@@ -462,12 +438,26 @@ public:
     return *this;
   }
 
+  // Задать имя уровня, от которого идут запросы 
+  Hierarchy& set_requester(std::string name)
+  {
+    m_requester = std::move(name);
+    return *this;
+  }
+
+  // Название запрашивающего объекта
+  const std::string& requester() const
+  {
+    return m_requester;
+  }
+
   Cache& top()
   {
     ensure_linked();
     return m_levels.front();
   }
 
+  // Ссылка на объект нижнего уровня
   const Cache& top() const
   {
     return m_levels.front();
@@ -475,7 +465,25 @@ public:
 
   Response process(const Request& req)
   {
-    return top().process(req);
+    ensure_linked();
+    const auto& top_name = m_levels.front().name();
+
+    auto& log = cache::log::TraceLogger::instance();
+    log.request(m_requester, top_name, req);
+    Response resp = top().process(req);
+    
+    uint64_t address;
+    if (std::holds_alternative<ReadRequest>(req))
+    {
+      address = std::get<ReadRequest>(req).address;
+    }
+    else
+    {
+      address = std::get<WriteRequest>(req).address;
+    }
+
+    log.response(top_name, m_requester, resp, address);
+    return resp;
   }
 
   SimpleMemory& mem()
@@ -521,6 +529,36 @@ public:
       f << "# key=block_address  level=" << m_mem->name() << "\n";
       m_mem->dump(f);
     }
+  }
+
+private:
+  std::vector<Cache> m_levels;
+  std::optional<SimpleMemory> m_mem;
+  std::string m_requester{"CPU"};
+  bool m_linked = false;
+
+  void ensure_linked()
+  {
+    if (m_linked)
+    {
+      return;
+    }
+
+    if (m_levels.empty())
+    {
+      throw std::runtime_error("Hierarchy: no cache levels");
+    }
+
+    for (size_t i = 0; i + 1 < m_levels.size(); ++i)
+    {
+      m_levels[i].set_lower(m_levels[i + 1]);
+    }
+
+    if (m_mem)
+    {
+      m_levels.back().set_lower(*m_mem);
+    }
+    m_linked = true;
   }
 };
 

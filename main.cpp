@@ -40,13 +40,16 @@ static void seed_memory(cache::SimpleMemory& mem)
             << " blocks with random data into MEM\n";
 }
 
+// Запус трассы
 static void run_trace(std::istream& in, cache::Hierarchy& sys)
 {
   std::string line;
   size_t tick = 1;
 
+  // Пока находится линия обрабатываем ее
   while (std::getline(in, line))
   {
+    // Пустые строки и комментарии скипаем
     if (line.empty() || line[0] == '#')
     {
       continue;
@@ -83,6 +86,8 @@ static void run_trace(std::istream& in, cache::Hierarchy& sys)
       {
         data.push_back(static_cast<std::byte>(v & 0xFF));
       }
+      // Разворачиваем данные (так как записи из строки зеркально противоположны)
+      std::reverse(data.begin(), data.end());
       if (data.empty())
       {
         data.push_back(std::byte{0});
@@ -107,7 +112,7 @@ int main(int argc, char* argv[])
     ("help,h",    "help")
     ("trace,t",   po::value<std::string>(),  "trace file")
     ("fill,f",    po::bool_switch()->default_value(false), "seed random blocks into MEM")
-    ("dump,d",    po::value<std::string>(),  "dump final cache/memory state to directory (by block key)");
+    ("dump,d",    po::value<std::string>(),  "dump final cache/memory state to directory");
 
   po::variables_map vm;
 

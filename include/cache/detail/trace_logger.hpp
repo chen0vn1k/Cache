@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 #include <map>
+#include <optional>
 
 #include <boost/log/sources/logger.hpp>
 #include <boost/log/sources/record_ostream.hpp>
@@ -26,13 +27,13 @@ struct TraceInfo
   std::string_view event = "?";
   std::string_view operation = "?";
   
-  uint64_t address = 0;
+  std::optional<uint64_t> address;
 
 
-  size_t set = 0;
-  uint64_t tag = 0;
-  int way = 0;
-  uint64_t offset = 0;
+  std::optional<size_t> set;
+  std::optional<uint64_t> tag;
+  std::optional<int> way;
+  std::optional<uint64_t> offset;
 
 
   // Метаданные политик
@@ -40,8 +41,11 @@ struct TraceInfo
 
   // данные запроса или блока
   std::vector<std::byte> data {};
+  uint64_t size;
 
-  uint64_t size = 0;
+
+  // Прочие данные вывода
+  std::string_view other;
 };
 
 
@@ -54,15 +58,16 @@ public:
   // Глобальный экземпляр
   static TraceLogger& instance(); 
 
-  // Общий способ вывода
-  void emit(const TraceInfo& info);
-
   // Логирование запроса
   void request(std::string_view from, std::string_view to, Request req);
 
   // Логирование ответа
   void response(std::string_view from, std::string_view to, bool is_write,
                 uint64_t address, const std::vector<std::byte>& data);
+
+  // Логирование ответа (самый верхний)
+  void response(std::string_view from, std::string_view to, Response resp,
+                uint64_t address);
 
   // Логирование попадания в кэш
   void hit(std::string_view cache, bool is_write, uint64_t address,
@@ -110,6 +115,8 @@ private:
   // Объявляем logger как член класса
   boost::log::sources::logger_mt m_logger;
 
+  // Общий способ вывода
+  void emit(const TraceInfo& info);
 };
 
 } // namespace cache::log
