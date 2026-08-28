@@ -79,16 +79,19 @@ public:
     return m_lower_name;
   }
 
-  // Снимок валидных блоков: ключ = block address
-  // Формат строки: key=0xADDR set=.. way=.. tag=0x.. meta.. data=..
+  // Снимок валидных блоков
+  // Формат строки: addr=0xADDR set=.. way=.. tag=0x.. meta.. data=..
   void dump(std::ostream& out) const
   {
+    // Проходим по всем наборам
     for (size_t s = 0; s < m_core.get_num_sets(); ++s)
     {
       const auto& set = m_core.get_set(s);
+      // Проходим по всем way
       for (size_t w = 0; w < set.size(); ++w)
       {
         const auto& block = set[w];
+        // Пропускаем невалидные блоки
         if (!WritePolicy::is_valid(block))
         {
           continue;
@@ -106,39 +109,27 @@ public:
           out << ' ' << k << '=' << v;
         }
         out << " data=";
-        // те же 4-байтные слова, без хвостовых нулевых слов
+        // Правильный вывод данных
         {
-          bool any = false;
-          size_t last_nz = data.size();
-          while (last_nz > 0 && data[last_nz - 1] == std::byte{0})
+          out << std::hex << std::setfill('0');
+          size_t size = data.size();
+          for (size_t i = 0; i < size; i += 4)
           {
-            --last_nz;
-          }
-          size_t first_nz = 0;
-          while (first_nz < last_nz && data[first_nz] == std::byte{0})
-          {
-            ++first_nz;
-          }
-          // выравниваем first к границе слова 4
-          first_nz = (first_nz / 4) * 4;
-          if (last_nz == 0)
-          {
-            out << "0";
-          }
-          else
-          {
-            for (size_t i = first_nz; i < last_nz; i += 4)
-            {
-              if (any) out << '\'';
-              any = true;
-              uint32_t word = 0;
-              for (size_t j = 0; j < 4 && (i + j) < data.size(); ++j)
-              {
-                word |= (static_cast<uint32_t>(data[i + j]) << ((3 - j) * 8));
-              }
-              out << std::hex << std::setw(8) << std::setfill('0') << word << std::dec;
+            if (i != 0) {
+              out << '\'';
             }
-          }
+
+            // Запоминаем позицию в потоке перед началом записи текущего 4-байтового слова
+            std::string word;
+            for (size_t j = 0; j < 4 && (i + j) < size; ++j)
+            {
+              // Используем промежуточную строку
+              unsigned int val = std::to_integer<unsigned int>(data[size - 1 -i - j]);
+              
+              out << std::setw(2) << val;
+            }
+          } 
+          out << std::dec;
         }
         out << '\n';
       }
@@ -229,8 +220,8 @@ public:
     auto& log = cache::log::TraceLogger::instance();
 
     const uint64_t req_addr = is_write
-    ? std::get<WriteRequest>(req).address
-    : std::get<ReadRequest>(req).address;
+                            ? std::get<WriteRequest>(req).address
+                            : std::get<ReadRequest>(req).address;
 
     const int way = way_of(block, set);
 
@@ -239,12 +230,10 @@ public:
     log.hit(m_name, is_write, req_addr,
             decoded.set_index, decoded.tag,
             way, meta_of(block), pdata);
-
     // =============================================
 
     // обновляем метаданные в наборе
     AllocationPolicy::hit_handle(*this, block_address);
-
     
     // Обработка записи
     if (is_write)
@@ -263,17 +252,21 @@ public:
       // отправляем запрос дальше для write_through
       if constexpr (WritePolicy::requires_write_through())
       { 
-        lower_req(req);
+        // Обрабатывается только запись
+        if (is_write)
+        {
+          log.request(m_name, m_lower_name, req);
 
-        // =================== TRACE ===================
-        auto resp = wait_response(true, lower_res);
-        auto resp_data = is_write ? std::get<WriteRequest>(req).data
-                           : std::get<ReadResponse>(resp).data;
-        log.response(m_lower_name, m_name, true, req_addr,
-                     resp_data);
-        (void)resp;
-        // =============================================
+          lower_req(req);
 
+          // =================== TRACE ===================
+          auto resp = wait_response(true, lower_res);
+          auto resp_data = std::get<WriteRequest>(req).data;
+          log.response(m_lower_name, m_name, true, req_addr,
+                       resp_data);
+          (void)resp;
+          // =============================================
+        }
       }
       return response;
     }
@@ -309,8 +302,8 @@ public:
 
     // Проверям политику заведения
     bool need_allocate = is_write 
-                         ? AllocationPolicy::need_write_allocate(*this, block_address)
-                         : AllocationPolicy::need_read_allocate(*this, block_address);
+                       ? AllocationPolicy::need_write_allocate(*this, block_address)
+                       : AllocationPolicy::need_read_allocate(*this, block_address);
 
     // Если заведение запрещено
     if (!need_allocate)
@@ -374,6 +367,8 @@ public:
 
           (void) resp;
         }
+        // Сбрасываем данные блока перед заполнением
+        target_block->reset();
       }
 
       // =================== TRACE ===================
@@ -416,6 +411,25 @@ public:
       log.update(m_name, is_write, req_addr, decoded.set_index, decoded.tag, alloc_way,
                  meta_of(*target_block), target_block->upload());
 
+      // отправляем запрос дальше для write_through
+      if constexpr (WritePolicy::requires_write_through())
+      { 
+        // Обрабатывается только запись
+        if (is_write)
+        {
+          log.request(m_name, m_lower_name, req);
+
+          lower_req(req);
+
+          // =================== TRACE ===================
+          auto resp = wait_response(true, lower_res);
+          auto resp_data = std::get<WriteRequest>(req).data;
+          log.response(m_lower_name, m_name, true, req_addr,
+                       resp_data);
+          (void)resp;
+          // =============================================
+        }
+      }
       return ex;
     }
   }
@@ -423,8 +437,8 @@ public:
   // Обработка транзакции для одного блока
   template<typename LowerRequest, typename LowerResponse>
   cache::Response process_single_transaction(const cache::Request& req, 
-                                      LowerRequest& lower_req, 
-                                      LowerResponse& lower_res) 
+                                             LowerRequest& lower_req, 
+                                             LowerResponse& lower_res) 
   {
     // Узнаем какого типа запрос и получаем адресс
     bool is_write = std::holds_alternative<cache::WriteRequest>(req);

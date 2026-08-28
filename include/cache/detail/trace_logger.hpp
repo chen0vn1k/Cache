@@ -15,8 +15,12 @@
 #include <boost/log/expressions.hpp>
 
 #include "../../interfaces.hpp"
+
+
 namespace cache::log
 {
+// Вывод данных нужных образом
+std::string string_data(const std::vector<std::byte>& data);
 
 // Данные для логирования
 struct TraceInfo
@@ -66,8 +70,8 @@ public:
                 uint64_t address, const std::vector<std::byte>& data);
 
   // Логирование ответа (самый верхний)
-  void response(std::string_view from, std::string_view to, Response resp,
-                uint64_t address);
+  void response(std::string_view from, std::string_view to,
+                Request req, Response resp);
 
   // Логирование попадания в кэш
   void hit(std::string_view cache, bool is_write, uint64_t address,

@@ -196,8 +196,8 @@ void TraceLogger::response(std::string_view from, std::string_view to, bool is_w
 }
 
 // Логирование ответа
-void TraceLogger::response(std::string_view from, std::string_view to, Response resp,
-                           uint64_t address)
+void TraceLogger::response(std::string_view from, std::string_view to,
+                           Request req, Response resp)
 {
   const std::string cache_name = std::string(from) + "->" + std::string(to);
 
@@ -208,14 +208,14 @@ void TraceLogger::response(std::string_view from, std::string_view to, Response 
   if (std::holds_alternative<WriteResponse>(resp))
   {
     info.operation = "WR";
-    info.address   = address;
-    info.other     = "success";
+    info.address   = std::get<WriteRequest>(req).address;
+    info.data      = std::get<WriteRequest>(req).data;
   }
   else
   {
     const auto& r = std::get<ReadResponse>(resp);
     info.operation = "RD";
-    info.address   = address;
+    info.address   = std::get<ReadRequest>(req).address;
     info.data      = r.data;
   }
 

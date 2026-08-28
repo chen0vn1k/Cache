@@ -126,34 +126,28 @@ public:
     for (const auto& [key, pdata] : ordered)
     {
       out << std::hex << "0x" << key << std::dec << " data=";
-      const auto& data = *pdata;
-      size_t last_nz = data.size();
-      while (last_nz > 0 && data[last_nz - 1] == std::byte{0})
+      // Правильный вывод данных
       {
-        --last_nz;
-      }
-      size_t first_nz = 0;
-      while (first_nz < last_nz && data[first_nz] == std::byte{0})
-      {
-        ++first_nz;
-      }
-      first_nz = (first_nz / 4) * 4;
-      if (last_nz == 0)
-      {
-        out << "0\n";
-        continue;
-      }
-      bool any = false;
-      for (size_t i = first_nz; i < last_nz; i += 4)
-      {
-        if (any) out << '\'';
-        any = true;
-        uint32_t word = 0;
-        for (size_t j = 0; j < 4 && (i + j) < data.size(); ++j)
+        const auto& data = *pdata;
+        out << std::hex << std::setfill('0');
+        size_t size = data.size();
+        for (size_t i = 0; i < size; i += 4)
         {
-          word |= (static_cast<uint32_t>(data[i + j]) << ((3 - j) * 8));
-        }
-        out << std::hex << std::setw(8) << std::setfill('0') << word << std::dec;
+          if (i != 0) {
+            out << '\'';
+          }
+
+          // Запоминаем позицию в потоке перед началом записи текущего 4-байтового слова
+          std::string word;
+          for (size_t j = 0; j < 4 && (i + j) < size; ++j)
+          {
+            // Используем промежуточную строку
+            unsigned int val = std::to_integer<unsigned int>(data[size - 1 -i - j]);
+            
+            out << std::setw(2) << val;
+          }
+        } 
+        out << std::dec;
       }
       out << '\n';
     }
@@ -472,17 +466,7 @@ public:
     log.request(m_requester, top_name, req);
     Response resp = top().process(req);
     
-    uint64_t address;
-    if (std::holds_alternative<ReadRequest>(req))
-    {
-      address = std::get<ReadRequest>(req).address;
-    }
-    else
-    {
-      address = std::get<WriteRequest>(req).address;
-    }
-
-    log.response(top_name, m_requester, resp, address);
+    log.response(top_name, m_requester, req, resp);
     return resp;
   }
 
