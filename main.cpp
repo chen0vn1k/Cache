@@ -87,7 +87,6 @@ static void run_trace(std::istream& in, cache::Hierarchy& sys)
         data.push_back(static_cast<std::byte>(v & 0xFF));
       }
       // Разворачиваем данные (так как записи из строки зеркально противоположны)
-      std::reverse(data.begin(), data.end());
       if (data.empty())
       {
         data.push_back(std::byte{0});

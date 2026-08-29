@@ -76,16 +76,53 @@ public:
     {
       const auto& w = std::get<WriteRequest>(req);
       
-      // Записываем блок в память
-      m_storage[w.address] = w.data;
+      size_t data_size = w.data.size();
+      size_t offset_in_data = 0;
+      uint64_t current_addr = w.address;
       
+      // Пишем данные пока они не закончатся
+      while (offset_in_data < data_size)
+      {
+        // Выравниваем адрес до границы блока
+        uint64_t block_addr = (current_addr / m_block_size) * m_block_size;
+        
+        // Вычисляем смещение внутри блока
+        size_t offset = current_addr - block_addr;
+        
+        // Сколько байт можно записать в этот блок
+        size_t bytes_to_write = std::min(data_size - offset_in_data, m_block_size - offset);
+        
+        // Если данных по этому адресу еще нет - создаем блок из нулей
+        auto it = m_storage.find(block_addr);
+        if (it == m_storage.end())
+        {
+          m_storage[block_addr] = std::vector<std::byte>(m_block_size, std::byte{0});
+          it = m_storage.find(block_addr);
+        }
+        
+        // Получаем ссылку на блок
+        auto& block = it->second;
+        
+        // Копируем данные в блок
+        for (size_t i = 0; i < bytes_to_write; ++i)
+        {
+          block[offset + i] = w.data[offset_in_data + i];
+        }
+        
+        // Переходим к следующей части данных
+        offset_in_data += bytes_to_write;
+        current_addr += bytes_to_write;
+      }
       return WriteResponse{true};
     }
     // Чтение
     else
     {
       const auto& r = std::get<ReadRequest>(req);
-      auto it = m_storage.find(r.address);
+      
+      // Выравниваем адрес до границы блока
+      uint64_t block_addr = (r.address / m_block_size) * m_block_size;
+      auto it = m_storage.find(block_addr);
 
       // Если данные по адресу найдены
       if (it != m_storage.end())
@@ -103,8 +140,13 @@ public:
         }
         return ReadResponse{std::move(out), true};
       }
-      // Если промах в памяти, возвращаем нули
-      return ReadResponse{std::vector<std::byte>(r.size, std::byte{0}), true};
+      // Если промах в памяти, добавляем и возвращаем нули
+      else
+      {
+        // Записываем блок из нулей в память
+        m_storage[block_addr] = std::vector<std::byte>(m_block_size, std::byte{0});
+        return ReadResponse{std::vector<std::byte>(r.size, std::byte{0}), true};
+      }
     }
   }
 
@@ -117,7 +159,7 @@ public:
   // Снимок: ключ = block address
   void dump(std::ostream& out) const
   {
-    // стабильный порядок по ключу
+    // стабильный порядок по адресу
     std::map<uint64_t, const std::vector<std::byte>*> ordered;
     for (const auto& [addr, data] : m_storage)
     {
@@ -131,18 +173,29 @@ public:
         const auto& data = *pdata;
         out << std::hex << std::setfill('0');
         size_t size = data.size();
-        for (size_t i = 0; i < size; i += 4)
+        
+        for (size_t i = 0; i < m_block_size; i += 4)
         {
           if (i != 0) {
             out << '\'';
           }
 
           // Запоминаем позицию в потоке перед началом записи текущего 4-байтового слова
-          std::string word;
-          for (size_t j = 0; j < 4 && (i + j) < size; ++j)
+          for (size_t j = 0; j < 4; ++j)
           {
+            size_t index = m_block_size - 1 - i - j;
             // Используем промежуточную строку
-            unsigned int val = std::to_integer<unsigned int>(data[size - 1 -i - j]);
+            unsigned int val;
+            
+            // Если данные заканчиваются, то заполняем нулями
+            if (index < size)
+            {
+              val = std::to_integer<unsigned int>(data[index]);
+            }
+            else
+            {
+              val = 0;
+            }
             
             out << std::setw(2) << val;
           }
@@ -462,11 +515,26 @@ public:
     ensure_linked();
     const auto& top_name = m_levels.front().name();
 
+    // Переворачиваем байты при запросе на запись
+    Request internal = req;
+    if (std::holds_alternative<WriteRequest>(internal))
+    {
+      std::reverse(std::get<WriteRequest>(internal).data.begin(),
+                   std::get<WriteRequest>(internal).data.end());
+    }
+
     auto& log = cache::log::TraceLogger::instance();
-    log.request(m_requester, top_name, req);
-    Response resp = top().process(req);
+    log.request(m_requester, top_name, internal);
+    Response resp = top().process(internal);
+
+    // Переворачиваем байты при ответе на чтение
+    if (std::holds_alternative<ReadResponse>(resp))
+    {
+      std::reverse(std::get<ReadResponse>(resp).data.begin(),
+                   std::get<ReadResponse>(resp).data.end());
+    }
     
-    log.response(top_name, m_requester, req, resp);
+    log.response(top_name, m_requester, internal, resp);
     return resp;
   }
 

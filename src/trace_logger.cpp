@@ -38,7 +38,7 @@ std::string string_data(const std::vector<std::byte>& data)
         for (size_t j = 0; j < 4 && (i + j) < size; ++j)
         {
             // Используем промежуточную строку
-            unsigned int val = std::to_integer<unsigned int>(data[size - 1 -i - j]);
+            unsigned int val = std::to_integer<unsigned int>(data[size - 1 - i - j]);
             
             oss << std::setw(2) << val;
         }
